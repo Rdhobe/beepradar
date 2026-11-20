@@ -37,11 +37,11 @@ const PAGES = [
 ];
 
 const ADMIN_CONTROLS = [
-  ["01 // Run ingestion", "Run due sources is the safe button. It triggers only connected sources that have quota left and are off the 6h cooldown. The ready queue shows exactly what can run now."],
-  ["02 // Integrations", "Every keyed source appears with a connection state. Keys can come from Vercel env vars or be pasted once into the encrypted vault — the vault wins when both exist."],
+  ["01 // Run ingestion", "Run due sources is the safe button. It triggers only connected sources that have quota left and are off the 6h cooldown. The ready queue shows exactly what can run now, and the sticky status bar keeps success/error visible while you scroll."],
+  ["02 // Integrations", "Every keyed source appears with a connection state. Keys can come from Vercel env vars or be pasted once into the encrypted vault — the vault wins when both exist. Connect and Configure open in a modal, so the form appears where you are, not above the list."],
   ["03 // Keys vault", "AES-256-GCM encrypted with SOURCE_KEYS_SECRET. Never paste a real key into chat, a ticket or a screenshot. Masked values are safe to show."],
   ["04 // Advanced table", "Full source registry: adapter, cron, budgets, quotas and field mapping. Use Test fetch before enabling a custom HTTP source."],
-  ["05 // Tagging", "Rules run free at ingest. Switch mode to LLM to use GROQ_API_KEY; the provider/model and spend are tracked in Stats."],
+  ["05 // Tagging", "Rules run free at ingest. Switch mode to LLM to use GROQ_API_KEY; the provider/model and spend are tracked in Stats. The tagging log streams action summaries and per-batch LLM results, with Clear and History controls."],
 ];
 
 const RULES = [

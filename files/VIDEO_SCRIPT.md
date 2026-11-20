@@ -119,7 +119,7 @@
 > "This is the safe button. It runs only connected sources that have quota left and are off cooldown, in priority order — never all at once, never forty parallel requests."
 
 **Click it.** Let the live log stream. **Say while it runs:**
-> "The live log is per source: fetched, passed filter, inserted, duplicates by type. If a source returns 429, it goes into backoff and its daily budget is halved until a clean run. You can watch that here instead of guessing."
+> "The live log is per source: fetched, passed filter, inserted, duplicates by type. If a source returns 429, it goes into backoff and its daily budget is halved until a clean run. You can watch that here instead of guessing. The status bar stays pinned at the top, so you never scroll back up to find out whether the call succeeded."
 
 **If the ready queue is empty, say:**
 > "Nothing ready right now — everything connected is cooling down or quota-spent. That is the system working, not a bug. The queue refills on its own."
@@ -133,7 +133,7 @@
 **Scroll to `02 // Integrations`.**
 
 **Say:**
-> "Every keyed source is visible here with its state and required key names. You can paste a key once into the vault, or keep it in Vercel env; the vault wins if both exist."
+> "Every keyed source is visible here with its state and required key names. You can paste a key once into the vault, or keep it in Vercel env; the vault wins if both exist. Press Connect on a row even at the bottom of the list — the form opens as a modal in the centre of the screen, so you never scroll back up to save the key."
 
 **Click `+ Add integration`** — show the form shape (adapter, base URL, cron, quotas, field map), then **cancel**. Do not save a test source.
 
@@ -155,7 +155,7 @@
 
 **Scroll to `05 // Tagging`.**
 
-> "Tagging is rule-first and free at ingest. Switch to LLM mode only if you want the optional quality pass. `GROQ_API_KEY` is the provider configured here — default model `openai/gpt-oss-20b`. Cost is measured in Stats, so there is no surprise bill."
+> "Tagging is rule-first and free at ingest. Switch to LLM mode only if you want the optional quality pass. `GROQ_API_KEY` is the provider configured here — default model `openai/gpt-oss-20b`. Configure also opens as a modal. The black tagging log below streams each action and per-batch token result, so this pipeline is as observable as ingestion. Cost is measured in Stats, so there is no surprise bill."
 
 **Do not actually flip the mode to LLM during the recording** unless you intend to spend tokens.
 

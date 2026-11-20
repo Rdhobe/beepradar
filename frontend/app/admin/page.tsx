@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getSupabase, supabaseConfigured } from "@/lib/supabase/client";
 
 interface QuotaRow { n: number; per: string; hard?: boolean }
@@ -40,7 +40,11 @@ interface TaggingConfig {
 interface ProviderOption { id: string; label: string; keyEnv: string; defaultModel: string; models: string[] }
 interface Tagging {
   counts: Record<string, number>;
-  recent_runs: { id: number; ran_at: string; model: string; batch_size: number; input_tokens: number; output_tokens: number; ok: boolean; error: string | null }[];
+  recent_runs: {
+    id: number; ran_at: string; model: string; batch_size: number;
+    input_tokens: number; output_tokens: number; cached_input_tokens: number;
+    latency_ms: number; ok: boolean; error: string | null;
+  }[];
   config: TaggingConfig;
   providers: ProviderOption[];
 }
@@ -232,7 +236,21 @@ export default function AdminPage() {
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [runlog, setRunlog] = useState<RunLog>({ running: [], runs: [] });
   const [logBaseline, setLogBaseline] = useState<Set<string> | null>(null);
+  const [statusAt, setStatusAt] = useState<Date | null>(null);
+  const [tagLogBaseline, setTagLogBaseline] = useState<Set<number> | null>(null);
+  const [tagEvents, setTagEvents] = useState<{ id: number; at: string; text: string; kind: "ok" | "err" }[]>([]);
+  const tagEventId = useRef(0);
   const ingestBusy = busy !== null && (busy === "tick" || busy === "bulk" || busy === "readybulk" || busy.startsWith("run:"));
+  const TAG_ACTION_KEYS = ["tag", "retry", "retag", "reapply"];
+  const taggingBusy = busy !== null && (TAG_ACTION_KEYS.includes(busy) || busy === "tagcfg");
+  const shownTagRuns = tagLogBaseline == null
+    ? (tagging?.recent_runs ?? [])
+    : (tagging?.recent_runs ?? []).filter((r) => !tagLogBaseline.has(r.id));
+
+  function pushTagEvent(text: string, kind: "ok" | "err") {
+    tagEventId.current += 1;
+    setTagEvents((prev) => [{ id: tagEventId.current, at: new Date().toISOString(), text, kind }, ...prev].slice(0, 40));
+  }
   // A new run starts a fresh log session: runs already on screen at click time are
   // baselined out (by identity, not clock) so only this run's entries show.
   const runKey = (r: RunLogRow) => `${r.source}|${r.started_at}`;
@@ -270,6 +288,19 @@ export default function AdminPage() {
     if (resp.status === 401) { setAuth("denied"); return null; }
     return resp;
   }, []);
+
+  const beginTagLog = async () => {
+    setTagLogBaseline(new Set((tagging?.recent_runs ?? []).map((r) => r.id)));
+    const r = await adminFetch("/api/admin/tagging");
+    if (r && r.ok) {
+      const j: Tagging = await r.json();
+      setTagLogBaseline((prev) => {
+        const next = new Set(prev ?? []);
+        for (const row of j.recent_runs) next.add(row.id);
+        return next;
+      });
+    }
+  };
 
   const load = useCallback(async () => {
     try {
@@ -312,20 +343,55 @@ export default function AdminPage() {
     return () => { alive = false; clearInterval(iv); };
   }, [ingestBusy, adminFetch]);
 
+  // Keep the sticky status stamp fresh for every success / error.
+  useEffect(() => { if (banner) setStatusAt(new Date()); }, [banner]);
+
+  // Per-batch tagging rows land in llm_runs while a tagging action is running.
+  useEffect(() => {
+    if (!taggingBusy) return;
+    let alive = true;
+    const pull = async () => {
+      const r = await adminFetch("/api/admin/tagging");
+      if (r && r.ok) {
+        const j: Tagging = await r.json();
+        if (alive) setTagging(j);
+      }
+    };
+    pull();
+    const iv = setInterval(pull, 2000);
+    return () => { alive = false; clearInterval(iv); };
+  }, [taggingBusy, adminFetch]);
+
+  // Modals can always be dismissed with Escape, even while a run is streaming.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      setConnectFor(null);
+      setTagCfgOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   async function runAction(key: string, path: string, body: unknown, summarize: (j: any) => string): Promise<boolean> {
     if (key === "tick" || key.startsWith("run:")) await beginIngestLog();
+    if (TAG_ACTION_KEYS.includes(key)) await beginTagLog();
     setBusy(key);
     setBanner(null);
+    const report = (kind: "ok" | "err", text: string) => {
+      setBanner({ kind, text });
+      if (TAG_ACTION_KEYS.includes(key)) pushTagEvent(text, kind);
+    };
     try {
       const resp = await adminFetch(path, { method: "POST", body: JSON.stringify(body ?? {}) });
       if (!resp) return false;
       const j = await resp.json();
-      if (!resp.ok) { setBanner({ kind: "err", text: j.error ?? `Request failed (${resp.status})` }); return false; }
-      setBanner({ kind: "ok", text: summarize(j) });
+      if (!resp.ok) { report("err", j.error ?? `Request failed (${resp.status})`); return false; }
+      report("ok", summarize(j));
       await load();
       return true;
     } catch (e) {
-      setBanner({ kind: "err", text: e instanceof Error && e.name === "TimeoutError" ? "Request timed out (60s limit)" : String(e) });
+      report("err", e instanceof Error && e.name === "TimeoutError" ? "Request timed out (60s limit)" : String(e));
       return false;
     } finally {
       setBusy(null);
@@ -538,13 +604,22 @@ export default function AdminPage() {
       });
       if (!resp) return;
       const j = await resp.json();
-      if (!resp.ok) { setBanner({ kind: "err", text: j.error ?? `Save failed (${resp.status})` }); return; }
-      setBanner({ kind: "ok", text: `Tagging saved — ${tagDraft.mode === "free" ? "FREE RULES" : `${tagDraft.provider.toUpperCase()} · ${tagDraft.model}`}${tagDraft.api_key.trim() ? " · KEY ENCRYPTED" : ""}` });
+      if (!resp.ok) {
+        const text = j.error ?? `Save failed (${resp.status})`;
+        setBanner({ kind: "err", text });
+        pushTagEvent(text, "err");
+        return;
+      }
+      const text = `Tagging saved — ${tagDraft.mode === "free" ? "FREE RULES" : `${tagDraft.provider.toUpperCase()} · ${tagDraft.model}`}${tagDraft.api_key.trim() ? " · KEY ENCRYPTED" : ""}`;
+      setBanner({ kind: "ok", text });
+      pushTagEvent(text, "ok");
       setTagCfgOpen(false);
       setTagDraft((d) => ({ ...d, api_key: "" }));
       await load();
     } catch (e) {
-      setBanner({ kind: "err", text: String(e) });
+      const text = String(e);
+      setBanner({ kind: "err", text });
+      pushTagEvent(text, "err");
     } finally {
       setBusy(null);
     }
@@ -663,11 +738,24 @@ export default function AdminPage() {
         </div>
       </div>
 
-      {banner && (
-        <div className={`bcard px-4 py-3 text-sm font-bold ${banner.kind === "ok" ? "bg-[#00a651] text-white" : "bg-[#ff3b30] text-white"}`}>
-          {banner.kind === "ok" ? "✓ " : "!! "}{banner.text}
+      <div className="sticky top-0 z-40 -mt-2 pt-2" aria-live="polite">
+        <div className={`bcard flex flex-wrap items-center gap-3 px-4 py-2.5 ${!banner ? "bg-white" : banner.kind === "ok" ? "bg-[#00a651] text-white" : "bg-[#ff3b30] text-white"}`}>
+          <span className={`bchip ${!banner ? "bg-black text-[#ffd400]" : "bg-black/25 text-white"}`}>
+            {!banner ? "STATUS // IDLE" : banner.kind === "ok" ? "STATUS // OK" : "STATUS // ERROR"}
+          </span>
+          <span className="min-w-0 flex-1 text-xs font-bold">
+            {banner ? `${banner.kind === "ok" ? "✓ " : "!! "}${banner.text}` : "No action yet — run a source, save a key, or configure tagging."}
+          </span>
+          {banner && statusAt && (
+            <span className="blabel text-[9px] opacity-80">{hms(statusAt.toISOString())} UTC</span>
+          )}
+          {busy && <span className="bchip bg-black text-[#ffd400]">{busy.toUpperCase()}…</span>}
+          {banner && (
+            <button className="bchip cursor-pointer bg-black/25 text-white hover:bg-black/40"
+              title="Dismiss status" aria-label="Dismiss status" onClick={() => setBanner(null)}>✕</button>
+          )}
         </div>
-      )}
+      </div>
 
       {!masterKey && (
         <div className="bcard bg-[#ffd400] p-4">
@@ -819,7 +907,10 @@ export default function AdminPage() {
         </div>
 
         {connectFor && (
-          <div className="bcard mb-6 bg-[#2400ff] p-5 text-white">
+          <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 sm:items-center"
+            role="dialog" aria-modal="true" aria-label={`Connect ${connectFor.name}`} onClick={() => setConnectFor(null)}>
+            <div className="bcard my-8 w-full max-w-2xl border-3 border-black bg-[#2400ff] p-5 text-white shadow-[10px_10px_0_#000]"
+              onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between">
               <p className="blabel text-sm">CONNECT: {connectFor.name}_</p>
               <button className="bbtn px-2 py-1 text-[10px]" onClick={() => setConnectFor(null)}>Close ✕</button>
@@ -851,6 +942,7 @@ export default function AdminPage() {
                 {busy === "keys" ? "Encrypting…" : "Save keys →"}
               </button>
               {!masterKey && <span className="blabel self-center text-[10px] text-[#ffd400]">SET SOURCE_KEYS_SECRET FIRST</span>}
+            </div>
             </div>
           </div>
         )}
@@ -1331,7 +1423,10 @@ export default function AdminPage() {
           </div>
 
           {tagCfgOpen && (
-            <div className="mt-3 border-3 border-black bg-[#ffd400]/20 p-3">
+            <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 sm:items-center"
+              role="dialog" aria-modal="true" aria-label="Configure tagging" onClick={() => setTagCfgOpen(false)}>
+            <div className="bcard my-8 w-full max-w-2xl border-3 border-black bg-[#ffd400]/95 p-5 shadow-[10px_10px_0_#000]"
+              onClick={(e) => e.stopPropagation()}>
               <p className="blabel text-[10px]">TAGGING CONFIGURE_</p>
               <div className="mt-2 flex flex-wrap items-center gap-4">
                 <label className="blabel flex items-center gap-1 text-[10px]">
@@ -1389,6 +1484,7 @@ export default function AdminPage() {
                 <button className="bbtn px-4 py-1 text-xs" disabled={!!busy} onClick={() => setTagCfgOpen(false)}>Cancel</button>
               </div>
             </div>
+            </div>
           )}
 
           <p className="blabel mt-3 border-l-4 border-[#00a651] pl-2 text-[10px] text-black/70">
@@ -1437,31 +1533,46 @@ export default function AdminPage() {
               </span>
             </div>
           )}
-          {tagging && tagging.recent_runs.length > 0 && (
-            <div className="mt-4 overflow-x-auto border-t-2 border-black pt-3">
-              <table className="min-w-full">
-                <thead>
-                  <tr>
-                    {["When", "Batch", "In tok", "Out tok", "OK", "Error"].map((h) => (
-                      <th key={h} className="blabel pb-1 pr-4 text-left text-[9px] text-black/50">{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {tagging.recent_runs.map((r) => (
-                    <tr key={r.id}>
-                      <td className="pr-4 font-mono text-[10px]">{dt(r.ran_at)}</td>
-                      <td className="pr-4 font-mono text-[10px]">{r.batch_size}</td>
-                      <td className="pr-4 font-mono text-[10px]">{r.input_tokens}</td>
-                      <td className="pr-4 font-mono text-[10px]">{r.output_tokens}</td>
-                      <td className="pr-4 font-mono text-[10px]">{r.ok ? "✓" : "✕"}</td>
-                      <td className="font-mono text-[10px] text-[#ff3b30]">{r.error ?? ""}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+          <div className="bcard mt-4 bg-black p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="blabel text-xs text-[#ffd400]">TAGGING LOG_</p>
+              <div className="flex flex-wrap items-center gap-2">
+                <button className="bchip cursor-pointer bg-white/10 text-white/70 hover:bg-white/25"
+                  title="Clear the box; the next action streams fresh entries"
+                  onClick={() => { setTagLogBaseline(new Set((tagging?.recent_runs ?? []).map((r) => r.id))); setTagEvents([]); }}>
+                  Clear
+                </button>
+                <button className="bchip cursor-pointer bg-white/10 text-white/70 hover:bg-white/25"
+                  title="Show the last 10 stored LLM runs again"
+                  onClick={() => setTagLogBaseline(null)}>
+                  History
+                </button>
+                <span className="blabel text-[9px] text-white/50">
+                  {taggingBusy ? "STREAMING… THIS ACTION" : tagLogBaseline != null ? "THIS SESSION — FINAL RESULTS" : "IDLE — LAST 10 LLM RUNS"}
+                </span>
+              </div>
             </div>
-          )}
+            <div className="bscroll mt-2 max-h-64 space-y-0.5 overflow-auto border-2 border-white/20 bg-black p-2 font-mono text-[10px] leading-snug text-[#00a651]">
+              {taggingBusy && (
+                <p className="text-[#ffd400]">▶ {busy} … RUNNING since {hms(statusAt?.toISOString())}</p>
+              )}
+              {tagEvents.map((e) => (
+                <p key={`event-${e.id}`} className={e.kind === "err" ? "text-[#ff3b30]" : ""}>
+                  [{hms(e.at)}] {e.text}
+                </p>
+              ))}
+              {shownTagRuns.map((r) => (
+                <p key={`run-${r.id}`} className={r.error ? "text-[#ff3b30]" : r.ok ? "" : "text-white/70"}>
+                  [{hms(r.ran_at)}] {r.model} // batch={r.batch_size} in={r.input_tokens} out={r.output_tokens}
+                  {r.cached_input_tokens ? ` cache=${r.cached_input_tokens}` : ""}
+                  {r.latency_ms ? ` ${r.latency_ms}ms` : ""} {r.ok ? "OK" : `FAILED ${r.error ?? ""}`}
+                </p>
+              ))}
+              {!taggingBusy && tagEvents.length === 0 && shownTagRuns.length === 0 && (
+                <p className="text-white/50">log clear — click Tag / Rule-tag; per-batch results and action summaries stream here.</p>
+              )}
+            </div>
+          </div>
         </div>
       </section>
     </div>

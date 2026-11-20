@@ -3,6 +3,8 @@
 > Read this file first. Every other file in this folder expands one part of it.
 > If you are an AI coding agent (Claude Code / Cursor): treat this folder as the source of truth. Do not invent sources, endpoints or prices that are not listed here. Anything marked **VERIFY** must be checked live before being relied on.
 
+> **Current layout note (2026-11-20):** the detailed docs indexed below live in `brain/brain/` (for example `brain/brain/02-sources.md`), not at this folder's root. The runtime source registry is `frontend/data/sources_registry.json`; older `files/brain/` mirrors are no longer part of the active layout. When docs and runtime config disagree, the runtime registry wins and the docs should be updated to match.
+
 ## One-line goal
 A live Next.js site that shows **200+ real fresher/intern job posts in India**, deduplicated, **LLM-tagged by role + city**, searchable, **auto-refreshed daily**, plus a video, a repo, a **50-post hand-checked accuracy number** and a **cost per 1,000 posts**.
 
