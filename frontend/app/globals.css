@@ -1,0 +1,137 @@
+@import "tailwindcss";
+
+:root {
+  --paper: #f4f1ea;
+  --ink: #000000;
+  --yellow: #ffd400;
+  --blue: #2400ff;
+  --red: #ff3b30;
+  --green: #00a651;
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  background-image: radial-gradient(#00000014 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+
+::selection {
+  background: var(--yellow);
+  color: var(--ink);
+}
+
+@layer components {
+  .bcard {
+    border: 3px solid var(--ink);
+    background: #fff;
+    box-shadow: 6px 6px 0 var(--ink);
+  }
+
+  .bcard-hover {
+    transition: transform 120ms ease, box-shadow 120ms ease;
+  }
+  .bcard-hover:hover {
+    transform: translate(-2px, -2px);
+    box-shadow: 9px 9px 0 var(--ink);
+  }
+
+  .bbtn {
+    display: inline-block;
+    border: 3px solid var(--ink);
+    background: #fff;
+    color: var(--ink);
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    box-shadow: 4px 4px 0 var(--ink);
+    transition: transform 100ms ease, box-shadow 100ms ease;
+    cursor: pointer;
+  }
+  .bbtn:hover:not(:disabled) {
+    transform: translate(2px, 2px);
+    box-shadow: 2px 2px 0 var(--ink);
+  }
+  .bbtn:active:not(:disabled) {
+    transform: translate(4px, 4px);
+    box-shadow: 0 0 0 var(--ink);
+  }
+  .bbtn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  .bbtn-yellow { background: var(--yellow); }
+  .bbtn-blue { background: var(--blue); color: #fff; }
+  .bbtn-ink { background: var(--ink); color: #fff; }
+  .bbtn-green { background: var(--green); color: #fff; }
+
+  /* Brutalist scrollbar for any internally-scrolling region (modal body, etc.) */
+  .bscroll {
+    scrollbar-width: thin;
+    scrollbar-color: var(--ink) var(--paper);
+  }
+  .bscroll::-webkit-scrollbar { width: 12px; height: 12px; }
+  .bscroll::-webkit-scrollbar-track { background: var(--paper); border-left: 2px solid var(--ink); }
+  .bscroll::-webkit-scrollbar-thumb { background: var(--ink); border: 2px solid var(--paper); }
+  .bscroll::-webkit-scrollbar-thumb:hover { background: var(--blue); }
+
+  .binput {
+    border: 3px solid var(--ink);
+    background: #fff;
+    box-shadow: 4px 4px 0 var(--ink);
+    outline: none;
+    font-family: ui-monospace, "Cascadia Mono", "Courier New", monospace;
+  }
+  .binput:focus {
+    background: var(--yellow);
+  }
+  .binput:focus::placeholder {
+    color: #00000080;
+  }
+
+  .bchip {
+    display: inline-block;
+    border: 2px solid var(--ink);
+    padding: 1px 8px;
+    font-family: ui-monospace, "Cascadia Mono", "Courier New", monospace;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    background: #fff;
+  }
+
+  .blabel {
+    font-family: ui-monospace, "Cascadia Mono", "Courier New", monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-weight: 700;
+  }
+
+  .btable {
+    border: 3px solid var(--ink);
+    background: #fff;
+    box-shadow: 6px 6px 0 var(--ink);
+    border-collapse: separate;
+    border-spacing: 0;
+  }
+  .btable th {
+    border-bottom: 3px solid var(--ink);
+    background: var(--ink);
+    color: #fff;
+    font-family: ui-monospace, "Cascadia Mono", "Courier New", monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 11px;
+    padding: 8px 12px;
+    text-align: left;
+  }
+  .btable td {
+    border-bottom: 1px solid #00000030;
+    padding: 8px 12px;
+    font-size: 13px;
+  }
+  .btable tr:last-child td {
+    border-bottom: none;
+  }
+}

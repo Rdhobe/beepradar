@@ -1,0 +1,1452 @@
+{
+  "version": 2,
+  "updated": "2026-11-20",
+  "architecture": {
+    "backend": "Python (all ingestion, normalization, dedupe, LLM tagging, scheduling)",
+    "frontend": "Next.js (search UI only, consumes Python API)",
+    "note": "Overrides brain/01-architecture.md routing rule. Python backend is long-running (no serverless timeout), so quota-aware staggered scheduling is done here."
+  },
+  "scheduler": {
+    "engine": "APScheduler or celery-beat inside Python backend",
+    "tick_cron": "*/15 * * * *",
+    "strategy": "On each tick, run ONLY sources that are (a) cron-due, (b) have remaining quota in every applicable window, (c) not in backoff, (d) have required env keys present. Never trigger all sources at once.",
+    "max_concurrent_sources": 2,
+    "quota_windows": ["minute", "hour", "day", "week", "month"],
+    "quota_reset_timezone": "UTC",
+    "usage_tracking": "Persist per-source request counts per window in DB (source_quota_usage table); check before EVERY request, not just per run.",
+    "safety_margin": 0.8,
+    "safety_margin_note": "For third_party/etiquette/unknown limits, budget = 80% of reported quota. Official limits may use up to 90%.",
+    "monthly_quota_policy": "Spread evenly: daily_allowance = ceil(monthly_budget / days_in_month). Never burst a monthly quota.",
+    "shared_ip_bucket_policy": "Sources with scope=global_ip share ONE bucket across all company tenants; never run two of them in parallel.",
+    "http_429_policy": "Honor Retry-After header. 3 consecutive 429s -> exponential backoff (1h, 2h, 4h ... max 24h) AND halve that source's daily_budget until a clean run.",
+    "caching": "Use ETag / If-Modified-Since on RSS and feed endpoints; a 304 costs no quota budget and skips processing.",
+    "missing_keys_policy": "If a source's required env vars are absent, skip it silently and log status=skipped_no_key (do not fail the tick).",
+    "logging": "Every request logged to source_runs (source_id, started_at, requests_used, fetched, inserted, dup counts, http_status, error). Feeds the video + cost numbers.",
+    "politeness_defaults": {
+      "user_agent": "BeepRadarBot/1.0 (+https://YOUR-DOMAIN; contact: YOUR-EMAIL)",
+      "min_delay_same_host_s": 3,
+      "respect_robots_txt": true,
+      "timeout_s": 15,
+      "max_retries": 3
+    }
+  },
+  "groups": [
+    {
+      "id": "G1_monthly_hard_cap",
+      "name": "Monthly hard-capped APIs (scarcest quota)",
+      "policy": "Trigger rarely, spread across the month. Gap-fillers only — never depend on these for the 200-post baseline."
+    },
+    {
+      "id": "G2_daily_quota",
+      "name": "Daily-quota keyed APIs",
+      "policy": "One staggered batch run per day, well under the daily cap. These are the primary volume drivers."
+    },
+    {
+      "id": "G3_hourly_quota",
+      "name": "Hourly/per-minute quota APIs (generous)",
+      "policy": "Daily runs far below hourly caps; per-request delay respects the per-minute limit."
+    },
+    {
+      "id": "G4_etiquette_low_frequency",
+      "name": "Keyless feeds with published polling etiquette or unknown limits",
+      "policy": "1-2 polls/day max, cache with ETag, always attribute. Unknown limits => conservative self-imposed budget."
+    },
+    {
+      "id": "G5_no_published_limit",
+      "name": "Public ATS board APIs — no published read limit",
+      "policy": "Self-impose ~1 req/s per host, one platform per time slot, daily. Highest-quality India data (direct from employer)."
+    },
+    {
+      "id": "G6_shared_ip_anti_bot",
+      "name": "Keyless but IP-rate-limited / anti-bot fronted",
+      "policy": "Strict GLOBAL per-IP budget shared across all tenants of the platform. Slow, sequential, off-peak slots. Disable on repeated blocks."
+    }
+  ],
+  "sources": [
+    {
+      "id": "jsearch",
+      "name": "JSearch (OpenWeb Ninja, RapidAPI)",
+      "group": "G1_monthly_hard_cap",
+      "priority": 3,
+      "enabled": true,
+      "status": "pending_key",
+      "api": {
+        "base_url": "https://jsearch.p.rapidapi.com/search",
+        "method": "GET",
+        "auth": { "type": "rapidapi_key", "env": ["RAPIDAPI_KEY"] },
+        "params_example": { "query": "fresher developer jobs in Pune, India", "gl": "in", "num_pages": 1 }
+      },
+      "limits": {
+        "level": "official",
+        "quotas": [ { "n": 200, "per": "month", "hard": true }, { "n": 1000, "per": "hour" } ],
+        "reference": "https://rapidapi.com/letscrape-6bRBa3QguO5/api/jsearch/pricing"
+      },
+      "schedule": { "cron": "0 3,7,11,15,19,23 * * *", "max_requests_per_run": 1, "monthly_budget": 180, "request_delay_s": 4 },
+      "india": { "coverage": "high", "filter": "gl=in + city in query; licensed Google-for-Jobs aggregation" },
+      "compliance": { "attribution": "link to original posting", "terms_note": "RapidAPI marketplace licensed access; do NOT use the same vendor's LinkedIn scraper API" },
+      "notes": "6 calls/day x 30 = 180/month, under the 200 hard cap. Best fresher coverage of the marketplace APIs."
+    },
+    {
+      "id": "active_jobs_db",
+      "name": "Active Jobs DB (fantastic-jobs, RapidAPI)",
+      "group": "G1_monthly_hard_cap",
+      "priority": 4,
+      "enabled": true,
+      "status": "pending_key",
+      "api": {
+        "base_url": "https://active-jobs-db.p.rapidapi.com/active-ats-7d",
+        "method": "GET",
+        "auth": { "type": "rapidapi_key", "env": ["RAPIDAPI_KEY"] },
+        "params_example": { "limit": 100, "offset": 0, "title_filter": "intern", "location_filter": "India" },
+        "note": "Verify exact path/params against the RapidAPI listing before first run; up to 1000 jobs per call."
+      },
+      "limits": {
+        "level": "third_party",
+        "quotas": [ { "n": 25, "per": "month", "hard": true }, { "n": 1000, "per": "hour" } ],
+        "reference": "https://rapidapi.com/fantastic-jobs-fantastic-jobs-default/api/active-jobs-db/pricing"
+      },
+      "schedule": { "cron": "0 4 */2 * *", "max_requests_per_run": 1, "monthly_budget": 12, "request_delay_s": 5 },
+      "india": { "coverage": "high", "filter": "location_filter=India; covers 275k+ career sites/ATS" },
+      "compliance": { "attribution": "link to original posting", "terms_note": "same vendor LinkedIn API is excluded" },
+      "notes": "1 call every 2 days (~15/month) but each call returns up to 1000 jobs — highest yield-per-request source."
+    },
+    {
+      "id": "serpapi_google_jobs",
+      "name": "SerpApi Google Jobs",
+      "group": "G1_monthly_hard_cap",
+      "priority": 5,
+      "enabled": true,
+      "status": "pending_key",
+      "api": {
+        "base_url": "https://serpapi.com/search",
+        "method": "GET",
+        "auth": { "type": "api_key", "env": ["SERPAPI_KEY"] },
+        "adapter": "serpapi_jobs",
+        "engine": "google_jobs",
+        "query_loop": {
+          "what": ["fresher jobs in India", "internship in Bengaluru India", "internship in Mumbai India", "internship in Delhi India", "internship in Hyderabad India", "internship in Pune India", "graduate trainee jobs in India", "entry level software engineer jobs in India"],
+          "where": ["India", "Bengaluru, India", "Mumbai, India", "Delhi, India", "Hyderabad, India", "Pune, India"]
+        },
+        "note": "engine=google_jobs; jobs_results[]; title/company_name/location/description; share_link or apply_options[].link for attribution; detected_extensions.posted_at."
+      },
+      "limits": {
+        "level": "official",
+        "quotas": [{ "n": 250, "per": "month", "hard": true, "scope": "shared_serpapi_account" }],
+        "reference": "https://serpapi.com/google-jobs-api",
+        "note": "250 searches/month TOTAL across all SerpApi engines. Per-source monthly_budget values add up to 200 (80% safety margin)."
+      },
+      "schedule": { "cron": "0 6 * * *", "max_requests_per_run": 1, "monthly_budget": 100, "request_delay_s": 4, "scope": "shared_serpapi_account" },
+      "india": { "coverage": "high", "filter": "gl=in + India location; licensed Google Jobs aggregation (no direct Google scraping)" },
+      "compliance": { "attribution": "link back to original posting; label source as Google Jobs via SerpApi", "terms_note": "Licensed paid API. Never scrape Google or job boards directly. Result URLs are link-back only; BeepRadar does not fetch them." },
+      "notes": "100 of the 250 shared monthly searches reserved for Google Jobs. One rotated query per run; 6h cooldown still applies."
+    },
+    {
+      "id": "serpapi_indeed_jobs",
+      "name": "SerpApi Indeed Jobs",
+      "group": "G1_monthly_hard_cap",
+      "priority": 6,
+      "enabled": true,
+      "status": "pending_key",
+      "api": {
+        "base_url": "https://serpapi.com/search",
+        "method": "GET",
+        "auth": { "type": "api_key", "env": ["SERPAPI_KEY"] },
+        "adapter": "serpapi_jobs",
+        "engine": "indeed_jobs",
+        "query_loop": { "what": ["fresher jobs in India", "software intern in India", "graduate engineer jobs in India", "entry level analyst India"], "where": ["India"] },
+        "params_example": { "sort_by": "date" },
+        "note": "engine=indeed_jobs; location parameter for this engine is 'l'; jobs_results[] with title/company_name/location/description/link/days_since_posted."
+      },
+      "limits": {
+        "level": "official",
+        "quotas": [{ "n": 250, "per": "month", "hard": true, "scope": "shared_serpapi_account" }],
+        "reference": "https://serpapi.com/indeed-jobs-api",
+        "note": "Shares the same 250 searches/month with the other SerpApi engines."
+      },
+      "schedule": { "cron": "0 7 */2 * *", "max_requests_per_run": 1, "monthly_budget": 50, "request_delay_s": 4, "scope": "shared_serpapi_account" },
+      "india": { "coverage": "high", "filter": "India location; licensed Indeed Jobs API feed" },
+      "compliance": { "attribution": "link back to original posting; label source as Indeed Jobs via SerpApi", "terms_note": "Licensed paid API feed for a site on the do-not-scrape list. No direct Indeed requests are made by BeepRadar; result URLs are link-back only." },
+      "notes": "50 of 250 shared monthly searches. Result apply URLs are blocklisted hosts but are retained only for attribution via licensedFeed=true."
+    },
+    {
+      "id": "serpapi_glassdoor_jobs",
+      "name": "SerpApi Glassdoor Jobs",
+      "group": "G1_monthly_hard_cap",
+      "priority": 7,
+      "enabled": true,
+      "status": "pending_key",
+      "api": {
+        "base_url": "https://serpapi.com/search",
+        "method": "GET",
+        "auth": { "type": "api_key", "env": ["SERPAPI_KEY"] },
+        "adapter": "serpapi_jobs",
+        "engine": "glassdoor_jobs",
+        "query_loop": { "what": ["fresher software engineer India", "internship India", "graduate trainee India"], "where": ["India"] },
+        "note": "engine=glassdoor_jobs; jobs_results[] with job_id/title/company_name/location/link/days_since_posted; next_page_token available but one page/run is used."
+      },
+      "limits": {
+        "level": "official",
+        "quotas": [{ "n": 250, "per": "month", "hard": true, "scope": "shared_serpapi_account" }],
+        "reference": "https://serpapi.com/glassdoor-jobs-api",
+        "note": "Shares the same 250 searches/month with the other SerpApi engines."
+      },
+      "schedule": { "cron": "0 8 */2 * *", "max_requests_per_run": 1, "monthly_budget": 50, "request_delay_s": 4, "scope": "shared_serpapi_account" },
+      "india": { "coverage": "medium", "filter": "India location; licensed Glassdoor Jobs API feed" },
+      "compliance": { "attribution": "link back to original posting; label source as Glassdoor Jobs via SerpApi", "terms_note": "Licensed paid API feed for a site on the do-not-scrape list. No direct Glassdoor requests are made by BeepRadar; result URLs are link-back only." },
+      "notes": "50 of 250 shared monthly searches. Lower priority than Google Jobs because India coverage is thinner."
+    },
+    {
+      "id": "rapidapi_hirebase",
+      "name": "HireBase Jobs Data (RapidAPI)",
+      "group": "G1_monthly_hard_cap",
+      "priority": 8,
+      "enabled": true,
+      "status": "pending_key",
+      "api": {
+        "base_url": "https://hirebase-jobs-data.p.rapidapi.com/v2/jobs/search",
+        "method": "POST",
+        "auth": { "type": "rapidapi_key", "env": ["RAPIDAPI_KEY"] },
+        "body": { "job_titles": ["intern", "internship", "fresher", "graduate trainee"], "keywords": ["entry level", "new grad"], "geo_locations": [{ "country": "India" }], "page": 1, "limit": 25 },
+        "note": "Verified POST /v2/jobs/search. Header host is derived from base_url. Unknown body fields return 422 — use job_titles (plural) and geo_locations (not locations)."
+      },
+      "limits": {
+        "level": "official",
+        "quotas": [{ "n": 500, "per": "month", "hard": true }],
+        "reference": "https://rapidapi.com/hirebase-hirebase-default/api/hirebase-jobs-data/pricing",
+        "note": "500 jobs/month, billed 1 unit per job returned (not per request). limit=25 caps each call at 25 units."
+      },
+      "schedule": { "cron": "0 9 */2 * *", "max_requests_per_run": 1, "monthly_budget": 15, "request_delay_s": 5 },
+      "india": { "coverage": "high", "filter": "geo_locations country India; source postings come from employer career pages/ATS" },
+      "compliance": { "attribution": "link back to employer posting", "terms_note": "RapidAPI licensed feed; internship coverage comes from intern/fresher title filters (the separate Internships API is no longer available)." },
+      "notes": "15 calls/month x 25 jobs = at most 375 billed jobs, under the 500/month allowance."
+    },
+    {
+      "id": "rapidapi_linkedin_jobs",
+      "name": "LinkedIn Job Search API (Fantastic.jobs, RapidAPI)",
+      "group": "G1_monthly_hard_cap",
+      "priority": 9,
+      "enabled": true,
+      "status": "pending_key",
+      "api": {
+        "base_url": "https://linkedin-job-search-api.p.rapidapi.com/active-jb",
+        "method": "GET",
+        "auth": { "type": "rapidapi_key", "env": ["RAPIDAPI_KEY"] },
+        "params_example": { "time_frame": "24h", "limit": 100, "title": "intern OR fresher OR graduate trainee", "location": "India" },
+        "note": "V4 /active-jb endpoint recommended by the vendor for recurring ingestion. Each request deducts the number of jobs returned from Jobs credits plus 1 Requests credit."
+      },
+      "limits": {
+        "level": "third_party",
+        "quotas": [{ "n": 1000, "per": "hour" }],
+        "reference": "https://rapidapi.com/fantastic-jobs-fantastic-jobs-default/api/linkedin-job-search-api/pricing",
+        "note": "1000 req/hour is the general RapidAPI free-plan gateway cap; plan-specific monthly Jobs credits must be confirmed in the dashboard."
+      },
+      "schedule": { "cron": "0 2 * * *", "max_requests_per_run": 1, "daily_budget": 1, "request_delay_s": 5 },
+      "india": { "coverage": "high", "filter": "location=India + title intern/fresher/graduate; licensed LinkedIn data feed only" },
+      "compliance": { "attribution": "link back to original posting; label source as LinkedIn via RapidAPI", "terms_note": "Licensed paid API feed only. BeepRadar never fetches linkedin.com; result URLs are link-back only (licensedFeed=true). Direct LinkedIn scraping remains forbidden." },
+      "notes": "Enabled by user decision: paid/licensed feed with attribution, not direct scraping. Verify plan Jobs credits on first live run."
+    },
+    {
+      "id": "jobspipe",
+      "name": "JobsPipe",
+      "group": "G1_monthly_hard_cap",
+      "priority": 10,
+      "enabled": true,
+      "status": "pending_key",
+      "api": {
+        "base_url": "https://api.jobspipe.dev/v1/jobs/search",
+        "method": "POST",
+        "auth": { "type": "bearer", "env": ["JOBSPIPE_API_KEY"] },
+        "body": { "job_title_or": ["intern", "internship", "fresher", "graduate trainee", "entry level"], "job_country_code_or": ["IN"], "posted_at_max_age_days": 30, "status": "active", "limit": 25 },
+        "note": "OpenAPI spec at https://jobspipe.dev/openapi.json. Response { metadata, data[] } with id/job_title/company/url/location/description/posted_at. limit=25 is the free plan page size; one credit buys one job for the calendar month."
+      },
+      "limits": {
+        "level": "third_party",
+        "quotas": [{ "n": 1, "per": "day" }],
+        "reference": "https://jobspipe.dev/openapi.json",
+        "note": "Self-imposed 1 request/day. Exact free monthly credits are account-specific and not published in the spec — check dashboard before raising the budget."
+      },
+      "schedule": { "cron": "0 10 * * *", "max_requests_per_run": 1, "daily_budget": 1, "request_delay_s": 5 },
+      "india": { "coverage": "high", "filter": "job_country_code_or=IN + fresher title filters; aggregates 30+ public ATS boards" },
+      "compliance": { "attribution": "link back to original ATS posting", "terms_note": "Licensed aggregator of public ATS boards; no direct scraping of job boards." },
+      "notes": "Previously parked as paid-only; now included because a free-tier key is available. 402 = quota exhausted, 429 = rate limited, 502/504 = retry."
+    },
+    {
+      "id": "cleanjobdata_in",
+      "name": "CleanJobData — India fresher/intern",
+      "group": "G2_daily_quota",
+      "priority": 11,
+      "enabled": true,
+      "status": "pending_key",
+      "api": {
+        "base_url": "https://api.cleanjobdata.com/jobs",
+        "method": "GET",
+        "adapter": "cleanjobdata",
+        "auth": { "type": "bearer", "env": ["CLEANJOBDATA_API_KEY"] },
+        "query": { "location": "IN", "max_age": "30d", "limit": 20, "extra_fields": "description" },
+        "query_variants": [
+          { "title": "fresher", "experience_level": "EN" },
+          { "title": "intern", "employment_type": "INTERN" },
+          { "title": "graduate", "experience_level": "EN" },
+          { "title": "entry level", "experience_level": "EN" }
+        ],
+        "pages_per_variant": 2,
+        "note": "Official GET /jobs with Bearer auth. Trial plan: 300 requests/day and 20 jobs/response; application_url is a cleanjobdata.com/apply/{id} redirect. location=IN is the documented ISO2 filter when no city/state/country IDs are provided. extra_fields=description is required for the fresher heuristic. Cursor is pagination.next_page. VERIFY: account dashboard plan/limits, and whether the 14-day trial expires to paid or stops."
+      },
+      "limits": {
+        "level": "official",
+        "quotas": [{ "n": 300, "per": "day", "hard": true, "scope": "cleanjobdata_api_key" }],
+        "reference": "https://cleanjobdata.com/docs/api/jobs",
+        "note": "User account reports 300 requests/day on a 14-day trial. Self-imposed cap is 8 requests/run, once daily (160 jobs/day max at 20 jobs/response)."
+      },
+      "schedule": { "cron": "0 11 * * *", "max_requests_per_run": 8, "daily_budget": 8, "request_delay_s": 2 },
+      "india": { "coverage": "high", "filter": "location=IN plus EN entry-level and INTERN employment-type variants; site reports ~57K India jobs" },
+      "compliance": { "attribution": "link back via the CleanJobData application URL and label the feed as CleanJobData", "terms_note": "Official partner API. BeepRadar never scrapes employer sites; trial URLs are provider redirects and are stored for link-back only via RawJob.licensedFeed=true. Do not republish full descriptions without confirming the plan's terms." },
+      "notes": "Enabled with the reported trial key. Keep request_delay_s >=2 because CleanJobData also enforces a per-second bucket; 429 with a monthly-quota message must not be retried until the plan resets."
+    },
+    {
+      "id": "fantastic_jobs_in",
+      "name": "Fantastic.jobs — India fresher/intern (direct API)",
+      "group": "G2_daily_quota",
+      "priority": 12,
+      "enabled": true,
+      "status": "pending_key",
+      "api": {
+        "base_url": "https://data.fantastic.jobs",
+        "method": "GET",
+        "adapter": "fantastic_jobs",
+        "auth": { "type": "bearer", "env": ["FANTASTIC_JOBS_API_KEY"] },
+        "endpoints": ["/v1/active-ats", "/v1/active-jb"],
+        "rotation_hours": 6,
+        "params_example": {
+          "time_frame": "7d",
+          "limit": 10,
+          "description_format": "text",
+          "location": "India",
+          "ai_experience_level": "0-2"
+        },
+        "query_variants": [
+          { "title": "intern", "ai_employment_type": "INTERN" },
+          { "title": "fresher" },
+          { "title": "graduate trainee" },
+          { "title": "entry level" }
+        ],
+        "note": "Official direct API from dashboard.fantastic.jobs; Bearer FANTASTIC_JOBS_API_KEY (distinct from RAPIDAPI_KEY). Verified OpenAPI: https://data.fantastic.jobs/openapi. Bare JSON array response; ATS rows use organization/locations_derived/description_text/date_posted. Job-board rows additionally support seniority and exclude_recruiter_fields. One rotated request per run across 2 endpoints x 4 title variants; job-board calls add exclude_recruiter_fields=true."
+      },
+      "limits": {
+        "level": "official",
+        "quotas": [{ "n": 100, "per": "month", "hard": true }],
+        "reference": "https://fantastic.jobs/api",
+        "note": "14-day trial: 100 API requests and 500 included jobs (public pricing + user dashboard). Self-imposed cap is 3 req/day x 10 jobs = 420 jobs and 42 requests over 14 days, leaving margin under both limits. Raise monthly_budget/limit only after confirming the paid plan."
+      },
+      "schedule": { "cron": "0 */6 * * *", "max_requests_per_run": 1, "daily_budget": 3, "monthly_budget": 45, "request_delay_s": 5 },
+      "india": { "coverage": "high", "filter": "location=India (full country name per docs) + ai_experience_level=0-2 + rotating intern/fresher/graduate/entry-level title variants; ATS and LinkedIn job-board feeds" },
+      "compliance": { "attribution": "link back to the original employer or job-board posting and label the provider as Fantastic.jobs", "terms_note": "Licensed official API feed. Result URLs (including LinkedIn URLs) are stored for attribution/link-back only via RawJob.licensedFeed=true; BeepRadar never fetches linkedin.com or the originating site directly." },
+      "notes": "Enabled with the user's direct dashboard key. Separate from rapidapi_linkedin_jobs; both may run, but this source is the primary Fantastic.jobs feed during the trial. VERIFY in the dashboard how included jobs are counted (per returned row vs per unique URL) on the first live run."
+    },
+    {
+      "id": "apify_naukri",
+      "name": "Apify — Naukri jobs Actor",
+      "group": "G1_monthly_hard_cap",
+      "priority": 20,
+      "enabled": true,
+      "status": "pending_key",
+      "api": {
+        "base_url": "https://api.apify.com/v2/actors",
+        "method": "POST",
+        "adapter": "apify_actor",
+        "auth": { "type": "token", "env": ["APIFY_TOKEN"] },
+        "actor_id": "parsebird/naukri-jobs-scraper",
+        "input": {
+          "maxJobs": 100,
+          "fetchDetails": false,
+          "sortBy": "date",
+          "freshness": "30",
+          "experience": "0",
+          "proxyConfiguration": { "useApifyProxy": false }
+        },
+        "input_loop": { "keyword": ["fresher", "internship", "graduate trainee", "entry level"] },
+        "field_map": {
+          "sourceId": ["jobId"],
+          "url": ["jdURL"],
+          "title": ["title"],
+          "company": ["companyName"],
+          "location": ["location"],
+          "description": ["jobDescription"],
+          "postedAt": ["createdDate"]
+        },
+        "note": "Verified Actor: parsebird/naukri-jobs-scraper. POST /v2/actors/{actorId}/run-sync-get-dataset-items with the Actor INPUT as JSON and a 300s sync timeout. Standard mode is $1/1,000 results (fetchDetails=false); detailed mode is $3/1,000. Verified output fields: jobId, title, companyName, location, jdURL, createdDate, jobDescription (detailed only)."
+      },
+      "limits": {
+        "level": "self_imposed",
+        "quotas": [{ "n": 1, "per": "day" }],
+        "reference": "https://apify.com/parsebird/naukri-jobs-scraper",
+        "note": "Self-imposed 1 run/day and 10 runs/month; Actor bills $1/1,000 standard results or $3/1,000 detailed results."
+      },
+      "schedule": { "cron": "0 12 */3 * *", "max_requests_per_run": 1, "monthly_budget": 10, "request_delay_s": 10 },
+      "india": { "coverage": "high", "filter": "India fresher/entry-level via experience=0 and rotating keywords; no city IDs guessed" },
+      "compliance": { "attribution": "link back to original Naukri posting", "terms_note": "Paid third-party Actor feed. BeepRadar never requests naukri.com itself; result URLs are stored for attribution/link-back only via RawJob.licensedFeed=true. Confirm the Actor's terms before production use." },
+      "notes": "Enabled with the supplied Actor ID. One keyword per run rotated daily; standard mode keeps cost low."
+    },
+    {
+      "id": "apify_internshala",
+      "name": "Apify — Internshala Actor",
+      "group": "G1_monthly_hard_cap",
+      "priority": 21,
+      "enabled": true,
+      "status": "pending_key",
+      "api": {
+        "base_url": "https://api.apify.com/v2/actors",
+        "method": "POST",
+        "adapter": "apify_actor",
+        "auth": { "type": "token", "env": ["APIFY_TOKEN"] },
+        "actor_id": "crawloop/internshala-scraper",
+        "input": {
+          "listingType": "internships_and_jobs",
+          "location": "Bangalore,Mumbai,Delhi,Hyderabad,Pune,Chennai",
+          "maxItems": 100,
+          "maxPages": 20,
+          "monitorMode": true,
+          "monitorStoreName": "beepradar-internshala",
+          "proxyConfiguration": { "useApifyProxy": false }
+        },
+        "input_loop": { "position": ["python", "digital marketing", "data analytics", "web development", "content writing", "fresher"] },
+        "field_map": {
+          "sourceId": ["listingId"],
+          "url": ["url"],
+          "title": ["title"],
+          "company": ["employer"],
+          "location": ["location"],
+          "description": ["description"],
+          "postedAt": ["postedText", "postedDaysAgo"]
+        },
+        "note": "Verified Actor: crawloop/internshala-scraper. POST /v2/actors/{actorId}/run-sync-get-dataset-items with the Actor INPUT as JSON and a 300s sync timeout. Pricing from $0.89/1,000 listings. Verified output fields: listingId, listingType, url, title, employer, location, description, postedText/postedDaysAgo. monitorMode emits only new IDs after the first baseline run."
+      },
+      "limits": {
+        "level": "self_imposed",
+        "quotas": [{ "n": 1, "per": "day" }],
+        "reference": "https://apify.com/crawloop/internshala-scraper",
+        "note": "Self-imposed 1 run/day and 10 runs/month; Actor bills from $0.89/1,000 listings."
+      },
+      "schedule": { "cron": "0 13 */3 * *", "max_requests_per_run": 1, "monthly_budget": 10, "request_delay_s": 10 },
+      "india": { "coverage": "high", "filter": "India internships + fresher jobs via listingType and six-city comma-separated location input" },
+      "compliance": { "attribution": "link back to original Internshala posting", "terms_note": "Paid third-party Actor feed. BeepRadar never requests internshala.com itself; result URLs are stored for attribution/link-back only via RawJob.licensedFeed=true. Confirm the Actor's terms before production use." },
+      "notes": "Enabled with the supplied Actor ID; internship volume remains the priority. JSearch/Hirebase internship filters stay as complementary licensed routes."
+    },
+    {
+      "id": "apify_foundit",
+      "name": "Apify — Foundit / Monster India Actor",
+      "group": "G1_monthly_hard_cap",
+      "priority": 22,
+      "enabled": true,
+      "status": "pending_key",
+      "api": {
+        "base_url": "https://api.apify.com/v2/actors",
+        "method": "POST",
+        "adapter": "apify_actor",
+        "auth": { "type": "token", "env": ["APIFY_TOKEN"] },
+        "actor_id": "crawloop/foundit-jobs-scraper",
+        "input": {
+          "location": "Bangalore,Mumbai,Hyderabad,Pune,Delhi NCR",
+          "experienceMinYears": 0,
+          "experienceMaxYears": 2,
+          "postedWithinDays": "30",
+          "maxItems": 100,
+          "maxPages": 20,
+          "monitorMode": true,
+          "monitorStoreName": "beepradar-foundit",
+          "proxyConfiguration": { "useApifyProxy": false }
+        },
+        "input_loop": { "position": ["fresher", "intern", "graduate trainee", "entry level engineer"] },
+        "field_map": {
+          "sourceId": ["jobId"],
+          "url": ["applyUrl", "url"],
+          "title": ["title"],
+          "company": ["employer"],
+          "location": ["location"],
+          "description": ["description"],
+          "postedAt": ["postedAt", "postedAtRelative"]
+        },
+        "note": "Verified Actor: crawloop/foundit-jobs-scraper. POST /v2/actors/{actorId}/run-sync-get-dataset-items with the Actor INPUT as JSON and a 300s sync timeout. Pricing from $0.89/1,000 listings. Verified output fields: jobId, url, applyUrl, title, employer, location, description, postedAt/postedAtRelative. monitorMode emits only new IDs after the first baseline run."
+      },
+      "limits": {
+        "level": "self_imposed",
+        "quotas": [{ "n": 1, "per": "day" }],
+        "reference": "https://apify.com/crawloop/foundit-jobs-scraper",
+        "note": "Self-imposed 1 run/day and 10 runs/month; Actor bills from $0.89/1,000 listings."
+      },
+      "schedule": { "cron": "0 14 */3 * *", "max_requests_per_run": 1, "monthly_budget": 10, "request_delay_s": 10 },
+      "india": { "coverage": "medium", "filter": "India fresher/entry-level via experienceMinYears=0, experienceMaxYears=2 and rotating keywords" },
+      "compliance": { "attribution": "link back to original Foundit posting or employer apply URL", "terms_note": "Paid third-party Actor feed. BeepRadar never requests foundit.in itself; result URLs are stored for attribution/link-back only via RawJob.licensedFeed=true. Confirm the Actor's terms before production use." },
+      "notes": "Enabled with the supplied Actor ID. applyUrl is preferred over the Foundit detail URL so employer ATS links can be used where available."
+    },
+    {
+      "id": "adzuna_in",
+      "name": "Adzuna India",
+      "group": "G2_daily_quota",
+      "priority": 1,
+      "enabled": true,
+      "status": "pending_key",
+      "api": {
+        "base_url": "https://api.adzuna.com/v1/api/jobs/in/search/{page}",
+        "method": "GET",
+        "auth": { "type": "app_id_key", "env": ["ADZUNA_APP_ID", "ADZUNA_APP_KEY"] },
+        "params_example": { "results_per_page": 50, "what": "intern", "where": "bangalore", "sort_by": "date", "max_days_old": 14 },
+        "query_loop": { "what": ["intern", "internship", "fresher", "graduate trainee", "entry level"], "where": ["bangalore", "mumbai", "delhi", "hyderabad", "pune", "chennai", "kolkata", "gurgaon", "noida", "ahmedabad", "jaipur", "kochi"], "pages": 2 }
+      },
+      "limits": {
+        "level": "third_party",
+        "quotas": [ { "n": 25, "per": "minute" }, { "n": 250, "per": "day" }, { "n": 1000, "per": "week" }, { "n": 2500, "per": "month" } ],
+        "reference": "https://jobspipe.dev/alternatives/adzuna",
+        "note": "Official ToS now says limits are shown in your account dashboard — CONFIRM live after signup and update this entry."
+      },
+      "schedule": { "cron": "0 1 * * *", "max_requests_per_run": 120, "daily_budget": 200, "request_delay_s": 3 },
+      "india": { "coverage": "high", "filter": "country code 'in'; expect cross-source duplicates (aggregator redirect links)" },
+      "compliance": { "attribution": "hyperlink 'Adzuna' on displayed ads; salary estimates need Adzuna icons", "terms_note": "free tier for evaluation; commercial use needs paid plan" },
+      "notes": "120 requests/run covers 5 keywords x 12 cities x 2 pages. 3s delay = 20 req/min, under the 25/min cap."
+    },
+    {
+      "id": "jooble_in",
+      "name": "Jooble India",
+      "group": "G2_daily_quota",
+      "priority": 1,
+      "enabled": true,
+      "status": "pending_key",
+      "api": {
+        "base_url": "https://jooble.org/api/{api_key}",
+        "method": "POST",
+        "auth": { "type": "api_key_in_url", "env": ["JOOBLE_API_KEY"] },
+        "params_example": { "keywords": "intern", "location": "Bangalore", "page": 1 },
+        "note": "One key per country domain — request the India key at jooble.org/api/about."
+      },
+      "limits": {
+        "level": "official",
+        "quotas": [ { "n": 100, "per": "day", "reset": "midnight UTC" } ],
+        "reference": "https://help.jooble.org/en/support/solutions/articles/60001448238-rest-api-documentation",
+        "note": "A third-party claim of a 500-request LIFETIME cap exists — verify which applies to your key before relying on it."
+      },
+      "schedule": { "cron": "0 2 * * *", "max_requests_per_run": 80, "daily_budget": 80, "request_delay_s": 2 },
+      "india": { "coverage": "high", "filter": "India-domain key; strong local-board coverage" },
+      "compliance": { "attribution": "display listings with links back to Jooble", "terms_note": "partner terms" },
+      "notes": "80/day = 80% of the official 100/day cap."
+    },
+    {
+      "id": "careerjet_in",
+      "name": "Careerjet India",
+      "group": "G2_daily_quota",
+      "priority": 2,
+      "enabled": true,
+      "status": "pending_key",
+      "api": {
+        "base_url": "https://search.api.careerjet.net/v4/query",
+        "method": "GET",
+        "auth": { "type": "publisher_key", "env": ["CAREERJET_API_KEY"] },
+        "params_example": { "locale_code": "en_IN", "keywords": "intern", "location": "Bangalore", "page_size": 50 },
+        "note": "Free publisher key via careerjet.co.in/partners/api; verify v4 params live."
+      },
+      "limits": {
+        "level": "unknown",
+        "quotas": [ { "n": 1000, "per": "hour", "confidence": "unverified third-party" } ],
+        "reference": "https://publicapi.dev/careerjet-api"
+      },
+      "schedule": { "cron": "30 2 * * *", "max_requests_per_run": 60, "daily_budget": 100, "request_delay_s": 3 },
+      "india": { "coverage": "high", "filter": "dedicated .co.in portal" },
+      "compliance": { "attribution": "listings must link back (CPC publisher model)", "terms_note": "publisher agreement" },
+      "notes": "Limit unpublished — conservative self-imposed 100/day until verified."
+    },
+    {
+      "id": "himalayas",
+      "name": "Himalayas",
+      "group": "G3_hourly_quota",
+      "priority": 2,
+      "enabled": true,
+      "status": "confirmed",
+      "api": {
+        "base_url": "https://himalayas.app/jobs/api",
+        "method": "GET",
+        "auth": { "type": "optional_key", "env": ["HIMALAYAS_API_KEY"] },
+        "params_example": { "limit": 20 },
+        "pagination": "cursor preferred; offset deprecated (removal announced)",
+        "note": "Max 20 jobs/request. Keyless works but shared public pool; free key recommended."
+      },
+      "limits": {
+        "level": "official",
+        "quotas": [ { "n": 60, "per": "minute" }, { "n": 10000, "per": "day", "reset": "UTC" } ],
+        "reference": "https://himalayas.app/docs/remote-jobs-api"
+      },
+      "schedule": { "cron": "0 5 * * *", "max_requests_per_run": 60, "daily_budget": 100, "request_delay_s": 2 },
+      "india": { "coverage": "medium", "filter": "no confirmed country=india param — filter per-job location restrictions client-side for India/APAC-eligible" },
+      "compliance": { "attribution": "visible link to himalayas.app required; use their applicationLink", "terms_note": "remote-only board" },
+      "notes": "60 requests x 20 jobs = 1200 remote jobs scanned/day, far under 10k/day cap."
+    },
+    {
+      "id": "themuse",
+      "name": "The Muse",
+      "group": "G3_hourly_quota",
+      "priority": 4,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://www.themuse.com/api/public/jobs",
+        "method": "GET",
+        "auth": { "type": "optional_key", "env": ["THEMUSE_API_KEY"] },
+        "params_example": { "page": 1, "category": "Software Engineering" },
+        "note": "Keyless JSON confirmed live Oct 2026."
+      },
+      "limits": {
+        "level": "third_party",
+        "quotas": [ { "n": 500, "per": "hour", "scope": "unregistered" }, { "n": 3600, "per": "hour", "scope": "free registered key" } ],
+        "reference": "https://apis.io/providers/themuse/",
+        "note": "Official docs page 403s to bots — verify live."
+      },
+      "schedule": { "cron": "30 5 * * *", "max_requests_per_run": 20, "daily_budget": 40, "request_delay_s": 8 },
+      "india": { "coverage": "low", "filter": "US-centric employers; keep only India-location rows" },
+      "compliance": { "attribution": "link back to The Muse listing", "terms_note": "verify API terms live" },
+      "notes": "Optional volume top-up; low India yield."
+    },
+    {
+      "id": "hn_whoishiring",
+      "name": "Hacker News 'Who is hiring' (Algolia + Firebase)",
+      "group": "G3_hourly_quota",
+      "priority": 3,
+      "enabled": true,
+      "status": "confirmed",
+      "api": {
+        "base_url": "https://hn.algolia.com/api/v1/search?query=who%20is%20hiring&tags=story,author_whoishiring",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "second_hop": "https://hacker-news.firebaseio.com/v0/item/{id}.json (one request per comment; Firebase has NO official rate limit)",
+        "note": "Free-text comments -> LLM extracts job fields (extraction showcase for the video)."
+      },
+      "limits": {
+        "level": "official",
+        "quotas": [ { "n": 10000, "per": "hour", "scope": "Algolia per IP" }, { "n": null, "per": "none", "scope": "Firebase — no published limit, self-impose 1 req/s" } ],
+        "reference": "https://hn.algolia.com/api"
+      },
+      "schedule": { "cron": "25 0 * * *", "max_requests_per_run": 500, "daily_budget": 600, "request_delay_s": 1 },
+      "india": { "coverage": "low", "filter": "LLM/regex filter comments for India locations + intern/new-grad keywords; monthly thread, daily check is cheap" },
+      "compliance": { "attribution": "link to HN comment permalink", "terms_note": "public API" },
+      "notes": "New thread appears 1st of month; daily run mostly hits cache/304-equivalent (skip if thread unchanged)."
+    },
+    {
+      "id": "github_internship_lists",
+      "name": "GitHub curated internship lists (raw READMEs)",
+      "group": "G3_hourly_quota",
+      "priority": 2,
+      "enabled": true,
+      "status": "confirmed",
+      "api": {
+        "base_url": "https://raw.githubusercontent.com/{repo}/HEAD/README.md",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "repos": [
+          { "repo": "SimplifyJobs/Summer2027-Internships", "license": "none (all-rights-reserved)", "use": "link-out only, do not republish table content" },
+          { "repo": "speedyapply/2027-SWE-College-Jobs", "license": "none", "use": "link-out only; has India-internship sections" },
+          { "repo": "vanshb03/Summer2027-Internships", "license": "MIT", "use": "safest to parse and redistribute with attribution" }
+        ],
+        "note": "raw.githubusercontent.com has no published numeric limit (abuse detection applies). api.github.com fallback: 60 req/hr unauth, 5000/hr with PAT."
+      },
+      "limits": {
+        "level": "official",
+        "quotas": [ { "n": 60, "per": "hour", "scope": "api.github.com unauthenticated per IP" }, { "n": 5000, "per": "hour", "scope": "api.github.com with PAT" } ],
+        "reference": "https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api"
+      },
+      "schedule": { "cron": "10 0 * * *", "max_requests_per_run": 6, "daily_budget": 12, "request_delay_s": 3 },
+      "india": { "coverage": "medium", "filter": "parse markdown tables; keep India rows; repos renamed yearly — re-check names each season" },
+      "compliance": { "attribution": "link to repo + original posting", "terms_note": "respect per-repo license (see repos list)" },
+      "notes": "3 repos x 2 polls/day = 6 requests, trivially under limits."
+    },
+    {
+      "id": "remotive",
+      "name": "Remotive",
+      "group": "G4_etiquette_low_frequency",
+      "priority": 3,
+      "enabled": true,
+      "status": "confirmed",
+      "api": {
+        "base_url": "https://remotive.com/api/remote-jobs",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "params_example": { "category": "software-dev" },
+        "note": "candidate_required_location=India probe returned USA/Canada rows — verify exact location slug live; filter client-side."
+      },
+      "limits": {
+        "level": "official",
+        "quotas": [ { "n": 4, "per": "day", "kind": "advised maximum" }, { "n": 2, "per": "minute", "kind": "blocking threshold" } ],
+        "reference": "https://remotive.com/api-documentation",
+        "note": "In-response legal notice: 'a couple of times a day (we advise max. 4 times a day)... excessive requests will be blocked.' Data delayed 24h."
+      },
+      "schedule": { "cron": "0 6,18 * * *", "max_requests_per_run": 1, "daily_budget": 2, "request_delay_s": 30 },
+      "india": { "coverage": "medium", "filter": "candidate_required_location must include India/Worldwide/APAC" },
+      "compliance": { "attribution": "link back to Remotive URL + name Remotive as source", "terms_note": "CANNOT republish to other job boards (Jooble/Neuvoo/Google Jobs/LinkedIn); no email-gating listings" },
+      "notes": "2 polls/day = half the advised max."
+    },
+    {
+      "id": "jobicy",
+      "name": "Jobicy",
+      "group": "G4_etiquette_low_frequency",
+      "priority": 3,
+      "enabled": true,
+      "status": "confirmed",
+      "api": {
+        "base_url": "https://jobicy.com/api/v2/remote-jobs",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "params_example": { "count": 100, "geo": "apac" },
+        "note": "geo=india NOT supported (verified against live ?get=locations) — use geo=apac or anywhere, then client-side India filter. Feed covers last 7 days only; cursor valid 24h."
+      },
+      "limits": {
+        "level": "official",
+        "quotas": [ { "n": 1, "per": "hour", "kind": "max polling frequency" } ],
+        "reference": "https://github.com/Jobicy/remote-jobs-api",
+        "note": "'Automated polling must not run more frequently than once per hour; a few checks per day are normally sufficient.' Honor 429 Retry-After."
+      },
+      "schedule": { "cron": "0 */6 * * *", "max_requests_per_run": 1, "daily_budget": 4, "request_delay_s": 5 },
+      "india": { "coverage": "low", "filter": "geo=apac + client-side India-eligible check" },
+      "compliance": { "attribution": "keep canonical Jobicy URL, credit Jobicy, no stripping source", "terms_note": "attribution required" },
+      "notes": "4 polls/day, well under the 1/hour ceiling."
+    },
+    {
+      "id": "remoteok",
+      "name": "Remote OK",
+      "group": "G4_etiquette_low_frequency",
+      "priority": 4,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://remoteok.com/api",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "note": "First element of JSON array is a 'legal' object — read it on every run; terms can change."
+      },
+      "limits": {
+        "level": "unknown",
+        "quotas": [],
+        "reference": "https://remoteok.com/api",
+        "note": "No numeric limit in current terms — self-imposed etiquette budget."
+      },
+      "schedule": { "cron": "15 6,18 * * *", "max_requests_per_run": 1, "daily_budget": 2, "request_delay_s": 5 },
+      "india": { "coverage": "low", "filter": "location tags / worldwide rows; client-side India-eligible filter" },
+      "compliance": { "attribution": "MUST link back with follow (no nofollow!) to Remote OK URL and mention Remote OK as source — else API access suspended", "terms_note": "logo is registered trademark — no use without written permission; name is OK" },
+      "notes": "2 polls/day with caching."
+    },
+    {
+      "id": "weworkremotely_rss",
+      "name": "We Work Remotely RSS",
+      "group": "G4_etiquette_low_frequency",
+      "priority": 4,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://weworkremotely.com/remote-jobs.rss",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "note": "Per-category feeds also exist (e.g. /categories/remote-programming-jobs.rss). RSS officially offered."
+      },
+      "limits": {
+        "level": "unknown",
+        "quotas": [],
+        "reference": "https://weworkremotely.com/robots.txt",
+        "note": "No published numbers, no crawl-delay in robots.txt — self-imposed."
+      },
+      "schedule": { "cron": "30 6,18 * * *", "max_requests_per_run": 3, "daily_budget": 6, "request_delay_s": 5 },
+      "india": { "coverage": "low", "filter": "mostly US-timezone roles; keep Worldwide/India-eligible only" },
+      "compliance": { "attribution": "link back to WWR listing", "terms_note": "etiquette" },
+      "notes": "3 feeds x 2 polls/day."
+    },
+    {
+      "id": "workingnomads",
+      "name": "Working Nomads",
+      "group": "G4_etiquette_low_frequency",
+      "priority": 5,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://www.workingnomads.com/api/exposed_jobs/",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "note": "Public JSON confirmed live (200). No docs page found."
+      },
+      "limits": { "level": "unknown", "quotas": [], "reference": null, "note": "No published terms/limits — verify live; conservative budget." },
+      "schedule": { "cron": "45 6,18 * * *", "max_requests_per_run": 1, "daily_budget": 2, "request_delay_s": 5 },
+      "india": { "coverage": "low", "filter": "worldwide-remote rows; client-side India-eligible filter" },
+      "compliance": { "attribution": "link back to Working Nomads listing", "terms_note": "unknown — verify before production" },
+      "notes": "Optional top-up."
+    },
+    {
+      "id": "fourdayweek",
+      "name": "4 Day Week Week",
+      "group": "G4_etiquette_low_frequency",
+      "priority": 5,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://4dayweek.io/api/jobs",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "note": "Open JSON confirmed live; structured locations incl. country field. /feed also 200."
+      },
+      "limits": { "level": "unknown", "quotas": [], "reference": null, "note": "No published limits/terms — self-imposed." },
+      "schedule": { "cron": "0 7,19 * * *", "max_requests_per_run": 1, "daily_budget": 2, "request_delay_s": 5 },
+      "india": { "coverage": "low", "filter": "country=India client-side; mostly UK/EU/US" },
+      "compliance": { "attribution": "link back", "terms_note": "unknown — verify" },
+      "notes": "Optional top-up."
+    },
+    {
+      "id": "arbeitnow",
+      "name": "Arbeitnow",
+      "group": "G4_etiquette_low_frequency",
+      "priority": 6,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://www.arbeitnow.com/api/job-board-api",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "params_example": { "page": 1 },
+        "note": "Response header showed limit '50', window unstated (third-party). visa_sponsorship / remote flags available."
+      },
+      "limits": { "level": "unknown", "quotas": [ { "n": 50, "per": "unknown", "confidence": "unverified header observation" } ], "reference": "https://www.arbeitnow.com/blog/job-board-api" },
+      "schedule": { "cron": "15 7 * * *", "max_requests_per_run": 5, "daily_budget": 10, "request_delay_s": 5 },
+      "india": { "coverage": "low", "filter": "Germany/EU-centric; keep worldwide-remote India-eligible only" },
+      "compliance": { "attribution": "link back required", "terms_note": "commercial-use terms ambiguous — verify" },
+      "notes": "Lowest-priority feed; cut first if maintenance cost hurts."
+    },
+    {
+      "id": "greenhouse",
+      "name": "Greenhouse public boards",
+      "group": "G5_no_published_limit",
+      "priority": 1,
+      "enabled": true,
+      "status": "confirmed",
+      "api": {
+        "base_url": "https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "tokens_file": "data/ats_tokens.json",
+        "known_india_tokens": ["postman"],
+        "candidate_tokens": ["groww", "chargebee", "browserstack", "freshworks", "zeta", "inmobi", "druva", "mindtickle", "sprinklr", "moengage", "clevertap", "gupshup", "atlan", "juspay", "phonepe", "meesho", "swiggy", "zomato", "flipkart", "dream11", "sharechat", "urbancompany", "zepto", "slice", "navi", "cashfree", "pinelabs", "lenskart", "nykaa", "pharmeasy", "upgrad", "unacademy", "physicswallah", "spinny", "cardekho", "rapido", "licious", "uber", "atlassian", "rippling", "databricks", "stripe", "cloudflare", "airbnb", "figma"],
+        "note": "Token = slug in boards.greenhouse.io/{token}. Run scripts/probe_boards.py to keep only 200-with-India-jobs tokens. Do NOT conflate with keyed Harvest API (50 req/10s) — different surface."
+      },
+      "limits": {
+        "level": "none_published",
+        "quotas": [],
+        "reference": "https://docs.greenhouse.io/job-board.html",
+        "note": "No published limit for the public Job Board API. Self-impose ~1 req/s per token."
+      },
+      "schedule": { "cron": "0 8 * * *", "max_requests_per_run": 150, "daily_budget": 150, "request_delay_s": 1, "scope": "per_host" },
+      "india": { "coverage": "high", "filter": "fetch all jobs per token -> filter location India + fresher title keywords" },
+      "compliance": { "attribution": "link to original board posting", "terms_note": "official public read endpoint, no anti-bot observed" },
+      "notes": "Direct-from-employer = highest quality, lowest duplicate risk. Primary 200-post driver together with Lever/Ashby."
+    },
+    {
+      "id": "lever",
+      "name": "Lever public postings",
+      "group": "G5_no_published_limit",
+      "priority": 1,
+      "enabled": true,
+      "status": "confirmed",
+      "api": {
+        "base_url": "https://api.lever.co/v0/postings/{token}?mode=json",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "tokens_file": "data/ats_tokens.json",
+        "known_india_tokens": ["cred", "razorpay"],
+        "candidate_tokens": ["browserstack", "zepto", "groww", "meesho", "phonepe", "swiggy", "zomato", "postman", "freshworks", "zerodha", "dream11", "sharechat", "urbancompany", "slice", "jupiter", "juspay", "chargebee", "hasura", "mindtickle", "sprinklr", "druva", "zeta", "inmobi", "rapido", "licious", "lenskart", "nykaa", "pharmeasy", "upgrad", "unacademy", "spinny", "cardekho", "navi", "cashfree", "pinelabs", "moengage", "clevertap", "gupshup", "atlan"],
+        "note": "Fields: location, categories, hostedUrl. Documented Data API limit (10 req/s, burst 20) applies to the KEYED api.lever.co/v1 — not this public v0 surface; still stay polite."
+      },
+      "limits": {
+        "level": "none_published",
+        "quotas": [],
+        "reference": "https://github.com/lever/postings-api",
+        "note": "Postings API docs publish no read limit. Self-impose ~1 req/s."
+      },
+      "schedule": { "cron": "30 8 * * *", "max_requests_per_run": 150, "daily_budget": 150, "request_delay_s": 1, "scope": "per_host" },
+      "india": { "coverage": "high", "filter": "location contains India city + fresher keywords" },
+      "compliance": { "attribution": "hostedUrl link-back", "terms_note": "official public JSON" },
+      "notes": "CRED and Razorpay confirmed on Lever."
+    },
+    {
+      "id": "ashby",
+      "name": "Ashby public job boards",
+      "group": "G5_no_published_limit",
+      "priority": 1,
+      "enabled": true,
+      "status": "confirmed",
+      "api": {
+        "base_url": "https://api.ashbyhq.com/posting-api/job-board/{token}",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "tokens_file": "data/ats_tokens.json",
+        "known_india_tokens": ["Aspora"],
+        "candidate_tokens": ["sarvam-ai", "razorpay", "groww", "cred", "zepto", "postman", "browserstack", "chargebee", "hasura", "atlan", "moengage", "clevertap"],
+        "note": "Officially documented public API. Growing fast among startups — re-probe tokens monthly."
+      },
+      "limits": {
+        "level": "none_published",
+        "quotas": [],
+        "reference": "https://developers.ashbyhq.com/docs/public-job-posting-api",
+        "note": "No documented limit — self-impose ~1 req/s."
+      },
+      "schedule": { "cron": "0 9 * * *", "max_requests_per_run": 100, "daily_budget": 100, "request_delay_s": 1, "scope": "per_host" },
+      "india": { "coverage": "high", "filter": "location + fresher keywords; many new-age Indian startups" },
+      "compliance": { "attribution": "link to jobs.ashbyhq.com posting", "terms_note": "official public API" },
+      "notes": "Token names are case-sensitive (e.g. 'Aspora')."
+    },
+    {
+      "id": "smartrecruiters",
+      "name": "SmartRecruiters public postings",
+      "group": "G5_no_published_limit",
+      "priority": 2,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://api.smartrecruiters.com/v1/companies/{token}/postings?limit=100&offset={offset}",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "tokens_file": "data/ats_tokens.json",
+        "candidate_tokens": ["Visa", "SocieteGenerale", "StandardChartered", "Tesco", "Bosch", "Siemens", "Philips", "PublicisGroupe", "Wipro", "Infosys", "TCS", "HCLTech", "TechMahindra", "Cognizant", "Capgemini", "Accenture", "Deloitte", "KPMG", "EY", "PwC"],
+        "note": "Paginated (limit/offset). Strong India presence via IT/services firms and GCCs. Tokens are case-sensitive company identifiers — probe variants."
+      },
+      "limits": {
+        "level": "official",
+        "quotas": [ { "n": 10, "per": "second" }, { "n": 8, "per": "concurrent" }, { "n": 2, "per": "second", "scope": "some publication endpoints" } ],
+        "reference": "https://developers.smartrecruiters.com/docs/rate-limiting",
+        "note": "429 on breach. Public postings tier not separately stated — stay <=2 req/s."
+      },
+      "schedule": { "cron": "30 9 * * *", "max_requests_per_run": 150, "daily_budget": 200, "request_delay_s": 1, "scope": "per_host" },
+      "india": { "coverage": "high", "filter": "country=in param supported; plus fresher title filter" },
+      "compliance": { "attribution": "link to SmartRecruiters posting", "terms_note": "official public API with documented limits" },
+      "notes": "Only ATS with officially documented rate limits — safest high-volume board source."
+    },
+    {
+      "id": "polymer",
+      "name": "Polymer public boards",
+      "group": "G5_no_published_limit",
+      "priority": 3,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://api.polymer.co/v1/hire/organizations/{slug}/jobs",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "tokens_file": "data/ats_tokens.json",
+        "note": "Officially public, keyless. Docs say 'rate-limited' without numbers."
+      },
+      "limits": { "level": "none_published", "quotas": [], "reference": "https://developer.polymer.co/", "note": "Self-impose <=1 req/s." },
+      "schedule": { "cron": "0 10 * * *", "max_requests_per_run": 50, "daily_budget": 50, "request_delay_s": 1, "scope": "per_host" },
+      "india": { "coverage": "medium", "filter": "startup skew, some India-remote" },
+      "compliance": { "attribution": "link to Polymer board", "terms_note": "official public API" },
+      "notes": "Small but clean source."
+    },
+    {
+      "id": "recruitee",
+      "name": "Recruitee public offers",
+      "group": "G5_no_published_limit",
+      "priority": 4,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://{token}.recruitee.com/api/offers/",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "tokens_file": "data/ats_tokens.json"
+      },
+      "limits": { "level": "none_published", "quotas": [], "reference": "https://docs.recruitee.com/reference/offers", "note": "No published limit for public surface — self-impose." },
+      "schedule": { "cron": "15 10 * * *", "max_requests_per_run": 50, "daily_budget": 50, "request_delay_s": 1, "scope": "per_host" },
+      "india": { "coverage": "low", "filter": "India presence small; probe tokens" },
+      "compliance": { "attribution": "link to offer page", "terms_note": "documented public endpoint" },
+      "notes": "EU-centric; optional."
+    },
+    {
+      "id": "personio",
+      "name": "Personio public XML feed",
+      "group": "G5_no_published_limit",
+      "priority": 6,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://{token}.jobs.personio.de/xml",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "tokens_file": "data/ats_tokens.json",
+        "note": "Some tenants serve /json — verify live per tenant. XML parsing needed (Python worker is the right home)."
+      },
+      "limits": { "level": "none_published", "quotas": [], "reference": "https://developer.personio.de/v1.0/reference/get_xml", "note": "Self-impose." },
+      "schedule": { "cron": "30 10 * * *", "max_requests_per_run": 30, "daily_budget": 30, "request_delay_s": 1, "scope": "per_host" },
+      "india": { "coverage": "low", "filter": "mostly DACH/EU; India presence minimal" },
+      "compliance": { "attribution": "link back", "terms_note": "officially documented feed" },
+      "notes": "Cut-first candidate."
+    },
+    {
+      "id": "teamtailor",
+      "name": "Teamtailor public jobs.json",
+      "group": "G5_no_published_limit",
+      "priority": 6,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://{token}.teamtailor.com/jobs.json",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "tokens_file": "data/ats_tokens.json",
+        "note": "Paginated 100/page. Official JSON:API (api.teamtailor.com/v1/jobs) needs per-tenant key — use the public career-site feed instead."
+      },
+      "limits": { "level": "none_published", "quotas": [], "reference": "https://cleanjobdata.com/articles/how-to-scrape-teamtailor-job-listings", "note": "Third-party confirmed pattern; self-impose." },
+      "schedule": { "cron": "45 10 * * *", "max_requests_per_run": 30, "daily_budget": 30, "request_delay_s": 1, "scope": "per_host" },
+      "india": { "coverage": "low", "filter": "EU-centric; India sparse" },
+      "compliance": { "attribution": "link back", "terms_note": "public career-site feed" },
+      "notes": "Cut-first candidate."
+    },
+    {
+      "id": "breezy",
+      "name": "Breezy HR public JSON",
+      "group": "G5_no_published_limit",
+      "priority": 5,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://{token}.breezy.hr/json",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "tokens_file": "data/ats_tokens.json",
+        "note": "Conflicting reports: some say JSON feed works, one says JSON-LD only. VERIFY live; fallback = schema.org JobPosting JSON-LD on job pages."
+      },
+      "limits": { "level": "none_published", "quotas": [], "reference": "https://adderleydata.com/guides/breezy-hr-job-board-api/", "note": "Self-impose." },
+      "schedule": { "cron": "0 11 * * *", "max_requests_per_run": 30, "daily_budget": 30, "request_delay_s": 2, "scope": "per_host" },
+      "india": { "coverage": "low", "filter": "SMB-heavy, some India users" },
+      "compliance": { "attribution": "link back", "terms_note": "verify endpoint existence per tenant" },
+      "notes": "Probe before enabling in production."
+    },
+    {
+      "id": "bamboohr",
+      "name": "BambooHR careers list",
+      "group": "G5_no_published_limit",
+      "priority": 5,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://{token}.bamboohr.com/careers/list",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "tokens_file": "data/ats_tokens.json",
+        "note": "Undocumented widget JSON backing the careers page. Official 'Get Job Summaries' API needs a key — don't use it."
+      },
+      "limits": { "level": "none_published", "quotas": [], "reference": "https://jobspipe.dev/sources/bamboohr", "note": "Self-impose; verify endpoint per tenant." },
+      "schedule": { "cron": "15 11 * * *", "max_requests_per_run": 30, "daily_budget": 30, "request_delay_s": 2, "scope": "per_host" },
+      "india": { "coverage": "low", "filter": "India presence modest" },
+      "compliance": { "attribution": "link back", "terms_note": "undocumented public widget — verify ToS" },
+      "notes": "Probe before enabling in production."
+    },
+    {
+      "id": "pinpoint",
+      "name": "Pinpoint job-postings widget JSON",
+      "group": "G5_no_published_limit",
+      "priority": 6,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://{token}.pinpointhq.com/api/v1/",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "tokens_file": "data/ats_tokens.json",
+        "note": "Exact path verify live against widget docs."
+      },
+      "limits": { "level": "none_published", "quotas": [], "reference": "https://developers.pinpointhq.com/docs/jobs-widget-overview", "note": "Self-impose." },
+      "schedule": { "cron": "30 11 * * *", "max_requests_per_run": 20, "daily_budget": 20, "request_delay_s": 2, "scope": "per_host" },
+      "india": { "coverage": "low", "filter": "UK-centric" },
+      "compliance": { "attribution": "link back", "terms_note": "public widget" },
+      "notes": "Cut-first candidate."
+    },
+    {
+      "id": "rippling_ats",
+      "name": "Rippling ATS public board",
+      "group": "G5_no_published_limit",
+      "priority": 4,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://ats.rippling.com/{token}/job-board",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "tokens_file": "data/ats_tokens.json",
+        "note": "Exact API path behind the board verify live (public API confirmed by third-party scrapers)."
+      },
+      "limits": { "level": "none_published", "quotas": [], "reference": "https://apify.com/adderleydata/rippling-jobs-scraper", "note": "Self-impose." },
+      "schedule": { "cron": "45 11 * * *", "max_requests_per_run": 30, "daily_budget": 30, "request_delay_s": 2, "scope": "per_host" },
+      "india": { "coverage": "medium", "filter": "India startups increasingly on Rippling" },
+      "compliance": { "attribution": "link back", "terms_note": "verify" },
+      "notes": "Growing source — re-probe tokens monthly."
+    },
+    {
+      "id": "comeet",
+      "name": "Comeet (Spark Hire Recruit) careers API",
+      "group": "G5_no_published_limit",
+      "priority": 6,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://www.comeet.co/careers-api/api/v1/company/{uid}/positions",
+        "method": "GET",
+        "auth": { "type": "public_token_in_page", "env": [] },
+        "tokens_file": "data/ats_tokens.json",
+        "note": "Needs public token + UID embedded in the career page — probe script extracts them. Pages also embed full jobs JSON as fallback."
+      },
+      "limits": { "level": "none_published", "quotas": [], "reference": "https://developers.comeet.com/reference/careers-api-list-all-positions", "note": "Self-impose." },
+      "schedule": { "cron": "0 12 * * *", "max_requests_per_run": 20, "daily_budget": 20, "request_delay_s": 2, "scope": "per_host" },
+      "india": { "coverage": "low", "filter": "Israeli/US skew; India sparse" },
+      "compliance": { "attribution": "link back", "terms_note": "documented careers API" },
+      "notes": "Cut-first candidate."
+    },
+    {
+      "id": "jazzhr",
+      "name": "JazzHR / ApplyToJob public XML feed",
+      "group": "G5_no_published_limit",
+      "priority": 6,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://{token}.applytojob.com/apply/xml/",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "tokens_file": "data/ats_tokens.json",
+        "note": "Exact feed path verify live per account. JSON API needs key — use XML feed. India example: Foundation AI (Hyderabad)."
+      },
+      "limits": { "level": "none_published", "quotas": [], "reference": "https://cleanjobdata.com/articles/how-to-scrape-jazzhr-job-listings", "note": "Self-impose." },
+      "schedule": { "cron": "15 12 * * *", "max_requests_per_run": 20, "daily_budget": 20, "request_delay_s": 2, "scope": "per_host" },
+      "india": { "coverage": "low", "filter": "some India employers" },
+      "compliance": { "attribution": "link back", "terms_note": "public XML feed" },
+      "notes": "Cut-first candidate."
+    },
+    {
+      "id": "workable",
+      "name": "Workable widget API (Cloudflare-fronted)",
+      "group": "G6_shared_ip_anti_bot",
+      "priority": 2,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://apply.workable.com/api/v1/widget/accounts/{token}?details=true",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "tokens_file": "data/ats_tokens.json",
+        "alt_url": "https://www.workable.com/api/accounts/{slug}?details=true",
+        "note": "Keyed SPI v3 exists but needs account key — use widget only."
+      },
+      "limits": {
+        "level": "measured",
+        "quotas": [ { "n": 8, "per": "40s", "scope": "per IP across ALL tenants", "kind": "measured, then Cloudflare error 1015" } ],
+        "reference": "https://adderleydata.com/guides/workable-job-board-api/"
+      },
+      "schedule": { "cron": "0 13 * * *", "max_requests_per_run": 100, "daily_budget": 200, "request_delay_s": 10, "scope": "global_ip" },
+      "india": { "coverage": "medium", "filter": "several Indian startups; probe tokens" },
+      "compliance": { "attribution": "link back", "terms_note": "public widget; CF blocks are a hard stop — back off, don't retry aggressively" },
+      "notes": "1 req/10s globally = 6/min, under the measured ~12/min threshold. Never parallelize tenants."
+    },
+    {
+      "id": "workday_cxs",
+      "name": "Workday CXS public job search",
+      "group": "G6_shared_ip_anti_bot",
+      "priority": 2,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://{company}.wd{N}.myworkdayjobs.com/wday/cxs/{company}/{site}/jobs",
+        "method": "POST",
+        "auth": { "type": "none", "env": [] },
+        "tokens_file": "data/ats_tokens.json",
+        "params_example": { "searchText": "intern", "limit": 20, "offset": 0 },
+        "note": "Undocumented but keyless. 2000-result cap per query — slice by location/facet. Huge India presence (enterprise GCCs: banks, IT services, product cos)."
+      },
+      "limits": {
+        "level": "measured",
+        "quotas": [ { "n": null, "per": "IP across ALL tenants", "kind": "edge rate-limiting + anti-bot observed; no numbers published" } ],
+        "reference": "https://cleanjobdata.com/articles/how-to-scrape-workday-job-listings"
+      },
+      "schedule": { "cron": "0 14 * * *", "max_requests_per_run": 200, "daily_budget": 300, "request_delay_s": 3, "scope": "global_ip" },
+      "india": { "coverage": "high", "filter": "searchText + location facet India; many fresher/graduate programs at GCCs" },
+      "compliance": { "attribution": "link to myworkdayjobs posting", "terms_note": "undocumented endpoint — verify robots.txt per tenant; disable on repeated blocks" },
+      "notes": " Highest-yield enterprise source but riskiest. Run alone in its slot (global_ip bucket)."
+    },
+    {
+      "id": "oracle_recruiting",
+      "name": "Oracle Cloud Recruiting CE JSON",
+      "group": "G6_shared_ip_anti_bot",
+      "priority": 4,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "https://{pod-hostname}/hcmRestApi/resources/latest/recruitingCEJobRequisitions",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "tokens_file": "data/ats_tokens.json",
+        "note": "Per-pod hostnames discovered from career pages. Keyless JSON behind every Oracle HCM career site."
+      },
+      "limits": { "level": "none_published", "quotas": [], "reference": "https://dev.to/datadaemon/oracle-recruiting-cloud-jobs-api-the-public-json-endpoints-behind-every-oracle-hcm-career-site-5eal", "note": "No published limit; self-impose global budget." },
+      "schedule": { "cron": "0 15 * * *", "max_requests_per_run": 60, "daily_budget": 100, "request_delay_s": 3, "scope": "global_ip" },
+      "india": { "coverage": "medium", "filter": "India enterprises on Oracle HCM" },
+      "compliance": { "attribution": "link back", "terms_note": "verify per tenant" },
+      "notes": "Probe hostnames before enabling."
+    },
+    {
+      "id": "icims",
+      "name": "iCIMS portals (JSON-LD only)",
+      "group": "G6_shared_ip_anti_bot",
+      "priority": 7,
+      "enabled": false,
+      "status": "verify",
+      "disabled_reason": "No keyless public JSON API; portals render JSON-LD with reported anti-bot. Partner-gated Job Portal API. Revisit only if short of 200 and after robots/ToS check.",
+      "api": {
+        "base_url": "https://careers-{company}.icims.com",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "note": "Big India employers (IT services) use iCIMS — high potential yield if a compliant path is found."
+      },
+      "limits": { "level": "unknown", "quotas": [], "reference": "https://developer-community.icims.com/applications/applicant-tracking/job-portal", "note": "Anti-bot reported — verify live." },
+      "schedule": { "cron": "0 16 * * *", "max_requests_per_run": 30, "daily_budget": 30, "request_delay_s": 5, "scope": "global_ip" },
+      "india": { "coverage": "high", "filter": "JSON-LD JobPosting extraction" },
+      "compliance": { "attribution": "link back", "terms_note": "check robots.txt + ToS before enabling" },
+      "notes": "Disabled by default."
+    },
+    {
+      "id": "successfactors",
+      "name": "SAP SuccessFactors career sites",
+      "group": "G6_shared_ip_anti_bot",
+      "priority": 7,
+      "enabled": false,
+      "status": "verify",
+      "disabled_reason": "Lowest-confidence target: legacy career?company= pages are HTML; Career Site Builder JSON endpoints undocumented, anti-bot possible. Large India enterprise presence — revisit if needed.",
+      "api": { "base_url": "https://performance{N}.successfactors.com/career?company={token}", "method": "GET", "auth": { "type": "none", "env": [] } },
+      "limits": { "level": "unknown", "quotas": [], "reference": null, "note": "Verify live." },
+      "schedule": { "cron": "0 17 * * *", "max_requests_per_run": 20, "daily_budget": 20, "request_delay_s": 5, "scope": "global_ip" },
+      "india": { "coverage": "high", "filter": "India enterprise presence large" },
+      "compliance": { "attribution": "link back", "terms_note": "verify ToS/robots before enabling" },
+      "notes": "Disabled by default."
+    },
+    {
+      "id": "jsonld_careers",
+      "name": "Company career pages with schema.org JobPosting JSON-LD",
+      "group": "G6_shared_ip_anti_bot",
+      "priority": 5,
+      "enabled": true,
+      "status": "verify",
+      "api": {
+        "base_url": "per-seed list",
+        "method": "GET",
+        "auth": { "type": "none", "env": [] },
+        "seeds_file": "worker/data/career_pages.txt",
+        "note": "httpx + extruct. Many Indian startup sites embed JSON-LD. Check each site's robots.txt/terms; crawl delay 3s; per-host politeness."
+      },
+      "limits": { "level": "none_published", "quotas": [], "reference": null, "note": "Per-host robots.txt + crawl-delay; self-impose." },
+      "schedule": { "cron": "30 13 * * *", "max_requests_per_run": 60, "daily_budget": 100, "request_delay_s": 3, "scope": "per_host" },
+      "india": { "coverage": "high", "filter": "seed list of Indian company career pages; JSON-LD gives structured fields for free" },
+      "compliance": { "attribution": "link back to career page", "terms_note": "respect robots.txt per site; blocklist guard applies" },
+      "notes": "Gap-filler if ATS boards + aggregators fall short of 200."
+    },
+    {
+      "id": "findwork",
+      "name": "Findwork.dev",
+      "group": "G2_daily_quota",
+      "priority": 7,
+      "enabled": false,
+      "status": "verify",
+      "disabled_reason": "API docs login-gated/unverifiable; dev/design jobs mostly remote/US — limited India yield. Re-check live before enabling.",
+      "api": { "base_url": "https://findwork.dev/api/jobs/", "method": "GET", "auth": { "type": "token", "env": ["FINDWORK_API_KEY"] } },
+      "limits": { "level": "third_party", "quotas": [ { "n": 60, "per": "minute" } ], "reference": "https://medium.com/@verahnyagaka101/findwork-job-search-api-for-your-job-portal-website-project-8ffb16ed0a19", "note": "No current official docs found." },
+      "schedule": { "cron": "0 18 * * *", "max_requests_per_run": 10, "daily_budget": 20, "request_delay_s": 2 },
+      "india": { "coverage": "low", "filter": "remote/dev jobs; India-eligible subset" },
+      "compliance": { "attribution": "verify", "terms_note": "verify" },
+      "notes": "Disabled until verified."
+    },
+    {
+      "id": "whatjobs",
+      "name": "WhatJobs partner feed",
+      "group": "G2_daily_quota",
+      "priority": 5,
+      "enabled": false,
+      "status": "pending_approval",
+      "disabled_reason": "No self-serve public search API; partner/CPC XML feeds via partnership approval. India portal exists — apply if volume needed.",
+      "api": { "base_url": "partner XML feed (assigned on approval)", "method": "GET", "auth": { "type": "partner_key", "env": ["WHATJOBS_PARTNER_KEY"] } },
+      "limits": { "level": "unknown", "quotas": [], "reference": "https://www.whatjobs.com/info/category/help-and-faq/help-for-employers/", "note": "Limits assigned per partnership." },
+      "schedule": { "cron": "0 19 * * *", "max_requests_per_run": 20, "daily_budget": 50, "request_delay_s": 3 },
+      "india": { "coverage": "high", "filter": "India portal" },
+      "compliance": { "attribution": "CPC link-back model", "terms_note": "partnership agreement" },
+      "notes": "Apply via partnership team; enable on approval."
+    },
+    {
+      "id": "talent_com",
+      "name": "Talent.com (ex-neuvoo) publisher API",
+      "group": "G2_daily_quota",
+      "priority": 5,
+      "enabled": false,
+      "status": "pending_approval",
+      "disabled_reason": "Self-serve job API + XML feeds gated behind publisher approval. Large India presence — worth applying.",
+      "api": { "base_url": "publisher endpoint (assigned on approval)", "method": "GET", "auth": { "type": "publisher_key", "env": ["TALENT_PUBLISHER_KEY"] } },
+      "limits": { "level": "unknown", "quotas": [], "reference": "https://employers.talent.com/publishers", "note": "Assigned per publisher agreement." },
+      "schedule": { "cron": "0 20 * * *", "max_requests_per_run": 20, "daily_budget": 50, "request_delay_s": 3 },
+      "india": { "coverage": "high", "filter": "large India presence" },
+      "compliance": { "attribution": "publisher link-back", "terms_note": "publisher agreement" },
+      "notes": "Apply at employers.talent.com/publishers; enable on approval."
+    },
+    {
+      "id": "jobvetta",
+      "name": "Jobvetta (India-focused)",
+      "group": "G2_daily_quota",
+      "priority": 6,
+      "enabled": false,
+      "status": "verify",
+      "disabled_reason": "Listed on publicapis.dev as India-focused job API with apiKey; endpoint/limits unknown — live check required before adding.",
+      "api": { "base_url": "unknown — discover via publicapis.dev/category/jobs", "method": "GET", "auth": { "type": "api_key", "env": ["JOBVETTA_API_KEY"] } },
+      "limits": { "level": "unknown", "quotas": [], "reference": "https://publicapis.dev/category/jobs", "note": "Unknown." },
+      "schedule": { "cron": "0 21 * * *", "max_requests_per_run": 10, "daily_budget": 20, "request_delay_s": 3 },
+      "india": { "coverage": "high", "filter": "India-focused per listing" },
+      "compliance": { "attribution": "verify", "terms_note": "verify" },
+      "notes": "Disabled until endpoint verified."
+    },
+    {
+      "id": "freejobalert_rss",
+      "name": "FreeJobAlert RSS",
+      "group": "G4_etiquette_low_frequency",
+      "priority": 6,
+      "enabled": false,
+      "status": "verify",
+      "disabled_reason": "Feed alive (WordPress RSS) and high India-fresher relevance, but NOT explicitly licensed for syndication. Link-out-only aggregation possible after ToS check.",
+      "api": { "base_url": "https://www.freejobalert.com/feed/", "method": "GET", "auth": { "type": "none", "env": [] } },
+      "limits": { "level": "unknown", "quotas": [], "reference": null, "note": "No published limits." },
+      "schedule": { "cron": "0 22 * * *", "max_requests_per_run": 1, "daily_budget": 2, "request_delay_s": 5 },
+      "india": { "coverage": "high", "filter": "India fresher/gov-job content feed" },
+      "compliance": { "attribution": "link out to original article", "terms_note": "ToS unclear — do not republish content; enable only after review" },
+      "notes": "Disabled pending ToS review."
+    },
+    {
+      "id": "reddit_india_oauth",
+      "name": "Reddit r/developersIndia + r/internshipsindia (OAuth Data API)",
+      "group": "G3_hourly_quota",
+      "priority": 6,
+      "enabled": false,
+      "status": "pending_approval",
+      "disabled_reason": "Public RSS ENDED 13 Nov 2026 (probes return 404/429); unauthenticated .json 403-blocked. Only viable path: registered OAuth app (100 QPM per client ID). Free-tier shutdown reportedly March 2027 — verify before investing.",
+      "api": { "base_url": "https://oauth.reddit.com/r/{subreddit}/new", "method": "GET", "auth": { "type": "oauth_app", "env": ["REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET"] } },
+      "limits": { "level": "official", "quotas": [ { "n": 100, "per": "minute", "scope": "per OAuth client ID (10-min average)" }, { "n": 10, "per": "minute", "scope": "without OAuth" } ], "reference": "https://www.reddit.com/r/reddit/comments/145bram/addressing_the_community_about_changes_to_our_api/" },
+      "schedule": { "cron": "0 23 * * *", "max_requests_per_run": 10, "daily_budget": 20, "request_delay_s": 2 },
+      "india": { "coverage": "medium", "filter": "free-text posts -> LLM extraction; low volume; always link back" },
+      "compliance": { "attribution": "strict attribution per Data API Terms", "terms_note": "register app; check current free-tier status first" },
+      "notes": "RSS variant is DEAD — do not schedule it."
+    },
+    {
+      "id": "homerun",
+      "name": "Homerun",
+      "group": "G5_no_published_limit",
+      "priority": 8,
+      "enabled": false,
+      "status": "verify",
+      "disabled_reason": "API requires key; NL/EU skew, negligible India yield. Not worth the integration cost.",
+      "api": { "base_url": "https://api.homerun.co", "method": "GET", "auth": { "type": "api_key", "env": ["HOMERUN_API_KEY"] } },
+      "limits": { "level": "unknown", "quotas": [], "reference": "https://developers.homerun.co/", "note": "Keyed." },
+      "schedule": { "cron": "0 0 * * *", "max_requests_per_run": 0, "daily_budget": 0, "request_delay_s": 2 },
+      "india": { "coverage": "low", "filter": "negligible" },
+      "compliance": { "attribution": "link back", "terms_note": "keyed API" },
+      "notes": "Parked."
+    },
+    {
+      "id": "usajobs",
+      "name": "USAJOBS",
+      "group": "G2_daily_quota",
+      "priority": 9,
+      "enabled": false,
+      "status": "confirmed",
+      "disabled_reason": "US federal jobs only — zero India relevance. Listed for completeness.",
+      "api": { "base_url": "https://data.usajobs.gov/api/Search", "method": "GET", "auth": { "type": "free_key", "env": ["USAJOBS_API_KEY"] } },
+      "limits": { "level": "unknown", "quotas": [], "reference": "https://developer.usajobs.gov/apirequest", "note": "500 rows/page, 10k/query cap; rate limit unpublished." },
+      "schedule": { "cron": "0 0 * * *", "max_requests_per_run": 0, "daily_budget": 0, "request_delay_s": 2 },
+      "india": { "coverage": "none", "filter": "US-only" },
+      "compliance": { "attribution": "public domain", "terms_note": "US federal" },
+      "notes": "Excluded: wrong geography."
+    },
+    {
+      "id": "reed_uk",
+      "name": "Reed.co.uk",
+      "group": "G2_daily_quota",
+      "priority": 9,
+      "enabled": false,
+      "status": "verify",
+      "disabled_reason": "UK-only — zero India relevance. Listed for completeness.",
+      "api": { "base_url": "https://www.reed.co.uk/api/1.0/search", "method": "GET", "auth": { "type": "free_key", "env": ["REED_API_KEY"] } },
+      "limits": { "level": "third_party", "quotas": [ { "n": 1000, "per": "day" } ], "reference": "https://publicapi.dev/reed-api", "note": "Official docs gated." },
+      "schedule": { "cron": "0 0 * * *", "max_requests_per_run": 0, "daily_budget": 0, "request_delay_s": 2 },
+      "india": { "coverage": "none", "filter": "UK-only" },
+      "compliance": { "attribution": "link back", "terms_note": "verify" },
+      "notes": "Excluded: wrong geography."
+    }
+  ],
+  "researched_unavailable": [
+    { "name": "Jobrapido", "reason": "No current public or self-serve partner API found (historically closed publisher program)." },
+    { "name": "JobisJob", "reason": "No current public API found." },
+    { "name": "Trovit", "reason": "No current public API found." },
+    { "name": "NoDesk", "reason": "All probed RSS/JSON paths 404 — no public feed." },
+    { "name": "DailyRemote", "reason": "All probed feed paths 404 — no public feed." },
+    { "name": "RemoteLeaf", "reason": "All probed feed paths 404 — no public feed." },
+    { "name": "Remote.co", "reason": "Feeds unreachable (connection failure/Cloudflare) — verify live; likely US-centric anyway." },
+    { "name": "JustRemote", "reason": "RSS alive but no documented API/limits; mostly US/UK, low India yield — parked." },
+    { "name": "NCS (ncs.gov.in)", "reason": "No public developer API; integrations are B2B partnerships. Scraping govt portal needs ToS/copyright review first." },
+    { "name": "AICTE internship portal", "reason": "No public API found; read terms + robots.txt before any attempt." },
+    { "name": "Freshteam", "reason": "No public JSON API; JSON-LD per job page only; keyed API. Covered by jsonld_careers source if seeds added." },
+    { "name": "Zoho Recruit", "reason": "No public jobs API; OAuth-keyed v2 only." },
+    { "name": "Keka / Darwinbox", "reason": "Career pages with embedded JSON unverified — add as jsonld_careers seeds after live probe." },
+    { "name": "Jobvite", "reason": "No public JSON API; XML feed + JSON-LD on career pages only — add as jsonld_careers seeds if needed." },
+    { "name": "Juju", "reason": "Legacy publisher API, likely dormant — status unknown." },
+    { "name": "TheirStack / Techmap / JobDataFeeds", "reason": "Paid aggregators with trials, no meaningful free tier. JobsPipe is now integrated via its free tier." },
+    { "name": "Google for Jobs direct", "reason": "No official API exists. Licensed routes: JSearch / Active Jobs DB / SerpApi Google Jobs (already included)." },
+    { "name": "Fantastic.jobs Internships API", "reason": "RapidAPI listing says this API is no longer available. Internships are sourced via JSearch and HireBase intern/fresher filters instead." }
+  ],
+  "blocklist_never_fetch": [
+    "linkedin.com", "naukri.com", "indeed.com", "internshala.com", "glassdoor.com",
+    "foundit.in", "instahyre.com", "wellfound.com", "shine.com", "timesjobs.com"
+  ],
+  "blocklist_note": "Code-level guard: BeepRadar never fetches these domains (incl. subdomains and redirect targets), and direct scraping of them (e.g. JobSpy) stays disabled. Exception approved 2026-11-20: paid/licensed data feeds may contribute job records; their URLs are stored for attribution/link-back only via RawJob.licensedFeed=true and are never fetched. Covered feeds: SerpApi Indeed/Glassdoor, RapidAPI LinkedIn Job Search, Fantastic.jobs direct API, CleanJobData, and the configured paid Apify Actors (parsebird/naukri-jobs-scraper, crawloop/internshala-scraper, crawloop/foundit-jobs-scraper). Unauthorized direct scrapers remain disabled and their URLs are still filtered.",
+  "daily_timeline_utc": [
+    "00:10 github_internship_lists",
+    "00:25 hn_whoishiring",
+    "01:00 adzuna_in (120 req, 3s delay)",
+    "02:00 jooble_in (80 req)",
+    "02:30 careerjet_in (60 req, when key present)",
+    "03/07/11/15/19/23:00 jsearch (1 req each)",
+    "04:00 active_jobs_db (every 2nd day, 1 req)",
+    "02:00 rapidapi_linkedin_jobs (1 req) | 06:00 serpapi_google_jobs (1 req)",
+    "07:00 serpapi_indeed_jobs (every 2nd day) | 08:00 serpapi_glassdoor_jobs (every 2nd day)",
+    "09:00 rapidapi_hirebase (every 2nd day) | 10:00 jobspipe (1 req) | 11:00 cleanjobdata_in (8 req) | 00/06/12/18:00 fantastic_jobs_in (1 req each, max 3/day during trial)",
+    "12:00 naukri apify | 13:00 internshala apify | 14:00 foundit apify (1 req each every 3rd day)",
+    "05:00 himalayas (60 req)",
+    "05:30 themuse (20 req)",
+    "06:00 remotive | 06:15 remoteok | 06:30 weworkremotely | 06:45 workingnomads",
+    "07:00 fourdayweek | 07:15 arbeitnow",
+    "08:00 greenhouse | 08:30 lever",
+    "09:00 ashby | 09:30 smartrecruiters",
+    "10:00 polymer | 10:15 recruitee | 10:30 personio | 10:45 teamtailor",
+    "11:00 breezy | 11:15 bamboohr | 11:30 pinpoint | 11:45 rippling_ats",
+    "12:00 comeet | 12:15 jazzhr",
+    "13:00 workable (global_ip) | 13:30 jsonld_careers",
+    "14:00 workday_cxs (global_ip)",
+    "15:00 oracle_recruiting (global_ip)",
+    "18:00 remotive/remoteok/weworkremotely/workingnomads second poll | 19:00 fourdayweek second poll",
+    "LLM tagging cron runs after ingest slots (e.g. 16:00 + self-chain), independent of source schedules"
+  ],
+  "verification_checklist": [
+    "Adzuna: confirm real limits in account dashboard after signup (third-party numbers may be stale)",
+    "Jooble: confirm whether 100/day or 500-lifetime cap applies to your key",
+    "JSearch / Active Jobs DB: confirm free-plan quotas on RapidAPI pricing page on signup day",
+    "SerpApi: confirm 250 searches/month on plan page; verify engine params (l for indeed_jobs, location for google/glassdoor) on first live run",
+    "HireBase RapidAPI: confirm host hirebase-jobs-data.p.rapidapi.com and 500-jobs/month allowance in the dashboard",
+    "RapidAPI LinkedIn: confirm host linkedin-job-search-api.p.rapidapi.com, /active-jb path and monthly Jobs credits in the dashboard",
+    "Fantastic.jobs direct: confirm the dashboard key works against data.fantastic.jobs with FANTASTIC_JOBS_API_KEY, and verify how the 500 included jobs are counted on the first live run (100 requests / 14 days trial)",
+    "JobsPipe: confirm free monthly credits and that limit=25 is accepted on the subscribed plan",
+    "Apify actors: confirm subscribed Actor access and per-result pricing in the Apify dashboard; verify monitorMode store names on first run",
+    "Careerjet: confirm v4 endpoint params + any quota in publisher agreement",
+    "The Muse: confirm keyless access + current limits (official docs 403 to bots)",
+    "Remotive: find exact India location slug (probe returned wrong rows)",
+    "Workable / Workday / Oracle: probe from production IP, watch for CF 1015 / 429, adjust global budgets",
+    "Breezy / BambooHR / Pinpoint / Rippling / Comeet / JazzHR: verify exact endpoint paths per tenant before production",
+    "All ATS tokens: run probe script, keep only 200-with-India-jobs tokens in data/ats_tokens.json",
+    "Reddit: check OAuth free-tier status (reported shutdown March 2027) before registering app",
+    "Record verification date per source in DB (sources.verified_at) — feeds the video"
+  ]
+}

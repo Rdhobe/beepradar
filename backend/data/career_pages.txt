@@ -1,0 +1,4 @@
+# One career-page URL per line. Pages must embed schema.org JobPosting JSON-LD.
+# robots.txt is checked automatically; blocklisted domains are never fetched.
+# Add seeds after verifying each site's terms, e.g.:
+# https://www.example-startup.com/careers

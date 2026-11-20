@@ -1,0 +1,244 @@
+# Machine-readable registry. Next.js reads this at ingest time; Python worker reads the `impl: python` entries.
+# status: confirmed | verify
+version: 1
+defaults:
+  user_agent: "BeepJobsAssignmentBot/1.0 (+https://YOUR-DOMAIN; contact: YOUR-EMAIL)"
+  timeout_ms: 15000
+  max_retries: 3
+  fresher_keywords: [intern, internship, fresher, graduate, trainee, entry level, entry-level, apprentice, associate, "sde 1", "sde-1", "0-1 years", "0-2 years", "batch of 2025", "batch of 2026", "campus"]
+  india_cities: [Bengaluru, Bangalore, Mumbai, Delhi, "New Delhi", Gurugram, Gurgaon, Noida, Hyderabad, Pune, Chennai, Kolkata, Ahmedabad, Jaipur, Chandigarh, Kochi, Indore, Remote]
+
+sources:
+  - id: adzuna_in
+    impl: next
+    type: aggregator_api
+    status: confirmed
+    auth: {app_id: ADZUNA_APP_ID, app_key: ADZUNA_APP_KEY}
+    url: "https://api.adzuna.com/v1/api/jobs/in/search/{page}"
+    params: {results_per_page: 50, sort_by: date, max_days_old: 14}
+    queries: [intern, internship, fresher, "graduate trainee", "entry level"]
+    cities: [bangalore, mumbai, delhi, hyderabad, pune, chennai, kolkata, gurgaon, noida, ahmedabad, jaipur, kochi]
+    pages: 3
+
+  - id: jooble
+    impl: next
+    type: aggregator_api
+    status: verify
+    auth: {api_key: JOOBLE_API_KEY}
+    url: "https://jooble.org/api/{api_key}"
+    method: POST
+
+  - id: jsearch
+    impl: next
+    type: aggregator_api
+    status: verify
+    auth: {rapidapi_key: RAPIDAPI_KEY}
+    role: gap_filler
+
+  - id: greenhouse
+    impl: next
+    type: ats_board
+    status: confirmed
+    url: "https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true"
+    tokens_file: data/ats_tokens.json   # produced by scripts/probe_boards.ts
+
+  - id: lever
+    impl: next
+    type: ats_board
+    status: verify
+    url: "https://api.lever.co/v0/postings/{token}?mode=json"
+    tokens_file: data/ats_tokens.json
+
+  - id: ashby
+    impl: next
+    type: ats_board
+    status: verify
+    url: "https://api.ashbyhq.com/posting-api/job-board/{token}"
+    tokens_file: data/ats_tokens.json
+
+  - id: smartrecruiters
+    impl: next
+    type: ats_board
+    status: verify
+    url: "https://api.smartrecruiters.com/v1/companies/{token}/postings?country=in"
+    tokens_file: data/ats_tokens.json
+
+  - id: workable
+    impl: next
+    type: ats_board
+    status: verify
+    url: "https://apply.workable.com/api/v1/widget/accounts/{token}"
+    tokens_file: data/ats_tokens.json
+
+  - id: remotive
+    impl: next
+    type: remote_feed
+    status: verify
+    url: "https://remotive.com/api/remote-jobs"
+    attribution_required: true
+    max_polls_per_day: 2
+  - id: himalayas
+    impl: next
+    type: remote_feed
+    status: verify
+    url: "https://himalayas.app/jobs/api"
+  - id: jobicy
+    impl: next
+    type: remote_feed
+    status: verify
+    url: "https://jobicy.com/api/v2/remote-jobs?geo=india"
+  - id: arbeitnow
+    impl: next
+    type: remote_feed
+    status: verify
+    optional: true
+    url: "https://www.arbeitnow.com/api/job-board-api"
+  - id: hn_whoishiring
+    impl: next
+    type: community
+    status: confirmed
+    url: "https://hn.algolia.com/api/v1/search?query=who%20is%20hiring&tags=story,author_whoishiring"
+    free_text: true            # LLM extracts fields
+
+  - id: reddit_india
+    impl: python
+    type: community
+    status: verify
+    feeds: ["https://www.reddit.com/r/developersIndia/.rss", "https://www.reddit.com/r/internshipsindia/.rss"]
+    free_text: true
+    note: "Check Reddit terms first; low volume; link back."
+
+  - id: jsonld_careers
+    impl: python
+    type: html_jsonld
+    status: verify
+    seeds_file: worker/data/career_pages.txt
+    respect_robots: true
+    crawl_delay_s: 3
+
+  - id: gov_portals
+    impl: python
+    type: portal
+    status: verify
+    note: "AICTE internship portal / Apprenticeship India / NCS — read terms + robots.txt before enabling."
+    enabled: false
+
+  # Licensed job-data APIs added 2026-11-20. Runtime source of truth is
+  # sources_registry.json; these entries document the same sources.
+  - id: serpapi_google_jobs
+    impl: next
+    type: aggregator_api
+    status: verify
+    auth: {api_key: SERPAPI_KEY}
+    url: "https://serpapi.com/search"
+    params: {engine: google_jobs, gl: in, hl: en}
+    monthly_budget: 100
+    note: "250 SerpApi searches/month shared across all engines."
+
+  - id: serpapi_indeed_jobs
+    impl: next
+    type: aggregator_api
+    status: verify
+    auth: {api_key: SERPAPI_KEY}
+    url: "https://serpapi.com/search"
+    params: {engine: indeed_jobs, l: India, sort_by: date}
+    monthly_budget: 50
+    note: "Licensed feed only; never request indeed.com directly."
+
+  - id: serpapi_glassdoor_jobs
+    impl: next
+    type: aggregator_api
+    status: verify
+    auth: {api_key: SERPAPI_KEY}
+    url: "https://serpapi.com/search"
+    params: {engine: glassdoor_jobs, location: India}
+    monthly_budget: 50
+    note: "Licensed feed only; never request glassdoor.com directly."
+
+  - id: rapidapi_hirebase
+    impl: next
+    type: aggregator_api
+    status: verify
+    auth: {rapidapi_key: RAPIDAPI_KEY}
+    url: "https://hirebase-jobs-data.p.rapidapi.com/v2/jobs/search"
+    method: POST
+    note: "500 jobs/month billed per job; 25-job pages, 15 calls/month. Internships via job_titles filter."
+
+  - id: rapidapi_linkedin_jobs
+    impl: next
+    type: aggregator_api
+    status: verify
+    auth: {rapidapi_key: RAPIDAPI_KEY}
+    url: "https://linkedin-job-search-api.p.rapidapi.com/active-jb"
+    params: {time_frame: 24h, limit: 100, location: India}
+    note: "Licensed feed only. Link-back URLs are retained via licensedFeed=true; never fetch linkedin.com."
+
+  - id: jobspipe
+    impl: next
+    type: aggregator_api
+    status: verify
+    auth: {bearer: JOBSPIPE_API_KEY}
+    url: "https://api.jobspipe.dev/v1/jobs/search"
+    method: POST
+    note: "Free tier page size 25; 1 req/day self-imposed until credits are confirmed."
+
+  - id: fantastic_jobs_in
+    impl: next
+    type: aggregator_api
+    status: verify
+    auth: {bearer: FANTASTIC_JOBS_API_KEY}
+    url: "https://data.fantastic.jobs"
+    endpoints: ["/v1/active-ats", "/v1/active-jb"]
+    params: {time_frame: 7d, limit: 10, description_format: text, location: India, ai_experience_level: "0-2"}
+    note: "Official direct API. 14-day trial: 100 requests + 500 jobs; self-imposed 3 req/day x 10 jobs. Separate from RAPIDAPI_KEY. LinkedIn/board URLs are link-back only via licensedFeed=true."
+
+  - id: cleanjobdata_in
+    impl: next
+    type: aggregator_api
+    status: verify
+    auth: {bearer: CLEANJOBDATA_API_KEY}
+    url: "https://api.cleanjobdata.com/jobs"
+    params: {location: IN, max_age: 30d, extra_fields: description, limit: 20}
+    note: "Official partner API. 14-day trial / 300 req per day reported by user; self-imposed 8 req/day. Trial application_url is a cleanjobdata.com redirect — link-back only via licensedFeed=true."
+
+  - id: apify_naukri
+    impl: next
+    type: actor_api
+    status: verify
+    auth: {bearer: APIFY_TOKEN}
+    url: "https://api.apify.com/v2/actors/parsebird/naukri-jobs-scraper/run-sync-get-dataset-items"
+    actor_id: parsebird/naukri-jobs-scraper
+    enabled: true
+    note: "Paid Actor feed. 1 run/day, 10/month; $1/1,000 standard results. Link-back-only URLs via licensedFeed=true. JSearch/Hirebase internships remain complementary."
+
+  - id: apify_internshala
+    impl: next
+    type: actor_api
+    status: verify
+    auth: {bearer: APIFY_TOKEN}
+    url: "https://api.apify.com/v2/actors/crawloop/internshala-scraper/run-sync-get-dataset-items"
+    actor_id: crawloop/internshala-scraper
+    enabled: true
+    note: "Paid Actor feed for internships + fresher jobs. 1 run/day, 10/month; from $0.89/1,000. Link-back-only URLs via licensedFeed=true."
+
+  - id: apify_foundit
+    impl: next
+    type: actor_api
+    status: verify
+    auth: {bearer: APIFY_TOKEN}
+    url: "https://api.apify.com/v2/actors/crawloop/foundit-jobs-scraper/run-sync-get-dataset-items"
+    actor_id: crawloop/foundit-jobs-scraper
+    enabled: true
+    note: "Paid Actor feed for Foundit/Monster India fresher roles. 1 run/day, 10/month; from $0.89/1,000. Prefer applyUrl for link-back."
+
+blocklist:   # never fetch directly; paid data-feed link-back exception documented in 02-sources.md
+  - linkedin.com
+  - naukri.com
+  - indeed.com
+  - internshala.com
+  - glassdoor.com
+  - foundit.in
+  - instahyre.com
+  - wellfound.com
+  - shine.com
+  - timesjobs.com
